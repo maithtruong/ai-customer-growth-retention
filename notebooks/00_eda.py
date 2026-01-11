@@ -17,8 +17,12 @@
 # # About
 
 # %% [markdown]
-# Fun fact:
-# This notebook used to be much longer but due to a jupytext error my progress was lost :(. It was all on me. Here is the summary of the findings that I got:
+# This notebook used to be much longer but due to a jupytext error my progress was lost :(. It was all on me. Here is the summary of the findings that I got from the old notebook:
+# - transactions vs. customers:
+#     - Different time spans, different number of users.
+#     - Transactions lack some customer_id from the customers set for possibly 2 reasons:
+#         - No transaction observed for that customer in the observation period.
+#         - Customers have not started their life spans yet (proven false, all customers have started their life span within 2025).
 # - Timespan
 #     - The observation window is smaller than the service window.
 #     - Observation window: Within 2025.
@@ -61,6 +65,9 @@ load_dotenv()
 # %%
 SEED_CUSTOMERS=os.getenv("SEED_CUSTOMERS")
 SEED_TRANSACTIONS=os.getenv("SEED_TRANSACTIONS")
+
+# %%
+OBSERVED_DATE = pd.Timestamp('2025-12-31')
 
 # %% [markdown]
 # ## Data
@@ -173,6 +180,132 @@ data_timespans = {
 # %%
 data_timespans
 
+
+# %% [markdown]
+# ## Customer Behavior
+
+# %% [markdown]
+# ## RFM Features
+
+# %% [markdown]
+# I need to check for the distributions of:
+# - Recency
+# - Frequency
+# - Monetary Values
+#
+# To choose a suitable method for setting segments.
+
+# %%
+def get_customers_screenshot_summary_from_transactions_df(
+    transactions_df: pd.DataFrame,
+    observed_date: pd.Timestamp,
+    column_names: list
+) -> pd.DataFrame:
+    """
+    Build a per-customer snapshot summary from a transactions DataFrame.
+
+    The function filters transactions up to the observed date and computes,
+    per customer:
+        - total transaction amount in the period
+        - first transaction date in the period
+        - last transaction date in the period
+        - number of transactions in the period
+        - days since last transaction until the observed date
+        - tenure in days within the observed period
+          (last transaction date minus first transaction date)
+
+    Parameters
+    ----------
+    transactions_df : pd.DataFrame
+        Input transactions data.
+    observed_date : pd.Timestamp
+        Cutoff date for the snapshot.
+    column_names : list
+        Column names in the following order:
+        [customer_id, transaction_date, amount]
+
+    Returns
+    -------
+    pd.DataFrame
+        Customer-level snapshot summary.
+    """
+
+    customer_col, transaction_date_col, amount_col = column_names
+
+    filtered_df = transactions_df[
+        transactions_df[transaction_date_col] <= observed_date
+    ]
+
+    summary_df = (
+        filtered_df
+        .groupby(customer_col, as_index=False)
+        .agg(
+            period_total_amount=(amount_col, 'sum'),
+            period_first_transaction_date=(transaction_date_col, 'min'),
+            period_last_transaction_date=(transaction_date_col, 'max'),
+            period_transaction_count=(customer_col, 'size')
+        )
+    )
+
+    summary_df['days_until_observed'] = (
+        observed_date - summary_df['period_last_transaction_date']
+    ).dt.days
+
+    summary_df['period_tenure_days'] = (
+        summary_df['period_last_transaction_date']
+        -
+        summary_df['period_first_transaction_date']
+    ).dt.days
+
+    return summary_df
+
+
+# %%
+customers_screenshot_summary_df = get_customers_screenshot_summary_from_transactions_df(
+    transactions_df = transactions_df,
+    observed_date = OBSERVED_DATE,
+    column_names = ['customer_id', 'transaction_date', 'amount']
+)
+
+# %%
+customers_screenshot_summary_df
+
+# %%
+## RECENCY
+col_name = 'days_until_observed'
+stat_df = mk.distribution_statistics_table(customers_screenshot_summary_df, value_col=col_name)
+fig = mk.create_histogram_plotly(customers_screenshot_summary_df, col_name)
+mk.stack_plotly_figure_with_dataframe(stat_df, fig)
+
+# %%
+## FREQUENCY
+col_name = 'period_transaction_count'
+stat_df = mk.distribution_statistics_table(customers_screenshot_summary_df, value_col=col_name)
+fig = mk.create_histogram_plotly(customers_screenshot_summary_df, col_name)
+mk.stack_plotly_figure_with_dataframe(stat_df, fig)
+
+# %%
+## MONETARY VALUE
+col_name = 'period_total_amount'
+stat_df = mk.distribution_statistics_table(customers_screenshot_summary_df, value_col=col_name)
+fig = mk.create_histogram_plotly(customers_screenshot_summary_df, col_name)
+mk.stack_plotly_figure_with_dataframe(stat_df, fig)
+
+# %%
+## TENURE
+col_name = 'period_tenure_days'
+stat_df = mk.distribution_statistics_table(customers_screenshot_summary_df, value_col=col_name)
+fig = mk.create_histogram_plotly(customers_screenshot_summary_df, col_name)
+mk.stack_plotly_figure_with_dataframe(stat_df, fig)
+
+# %% [markdown]
+# *The tenure part is technically not within RFM, but I'm just investigating for future modelling purposes.
+
+# %% [markdown]
+# Observation:
+# - All distributions are skewed (expected), but they are not TOO skewed to the point of not being divisable/segmentable (i.e. 1 purchase is already Q30)
+# - -> I can use Quantile binning methods.
+
 # %% [markdown]
 # # Churn Definition
 
@@ -185,10 +318,11 @@ data_timespans
 customers_obs_df = customers_df.copy()
 
 # %%
-observed_date = pd.Timestamp('2025-12-31')
+OBSERVED_DATE
 
+# %%
 customers_obs_df['is_churn'] = (
-    customers_obs_df['termination_date'] <= observed_date
+    customers_obs_df['termination_date'] <= OBSERVED_DATE
 ).astype(int)
 
 # %%
