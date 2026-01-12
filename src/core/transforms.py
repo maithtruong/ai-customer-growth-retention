@@ -8,6 +8,18 @@ and CLV models.
 
 import pandas as pd
 
+def transform_transactions_df(transactions_df):
+
+    transactions_df['transaction_date'] = pd.to_datetime(transactions_df['transaction_date'])
+    
+    return transactions_df
+def transform_customers_df(customers_df):
+
+    customers_df['signup_date'] = pd.to_datetime(customers_df['signup_date'])
+    customers_df['termination_date'] = customers_df['signup_date'] + pd.to_timedelta(customers_df['true_lifetime_days'], unit='D')
+    
+    return customers_df
+
 def get_customers_screenshot_summary_from_transactions_df(
     transactions_df: pd.DataFrame,
     observed_date: pd.Timestamp,

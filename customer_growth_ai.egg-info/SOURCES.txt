@@ -5,6 +5,7 @@ customer_growth_ai.egg-info/SOURCES.txt
 customer_growth_ai.egg-info/dependency_links.txt
 customer_growth_ai.egg-info/top_level.txt
 notebooks/00_eda.py
+notebooks/01_rfm.py
 notebooks/02_churn_classification.py
 notebooks/03_bg_nbd.py
 notebooks/04_survival_analysis.py
