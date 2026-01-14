@@ -7,6 +7,7 @@ and CLV models.
 """
 
 import pandas as pd
+from typing import Optional
 
 def transform_transactions_df(transactions_df):
 
@@ -105,19 +106,23 @@ def rfm_segment(row):
 
 def add_churn_status(
         transformed_customers_df: pd.DataFrame,
-        desired_df: pd.DataFrame,
-        observed_date: pd.Timestamp
+        observed_date: pd.Timestamp,
+        desired_df: Optional[pd.DataFrame] = None,
     ):
 
-    output_df = pd.merge(
-        desired_df,
-        transformed_customers_df[['customer_id', 'termination_date']],
-        on='customer_id',
-        how='inner'
-    )
+    if desired_df is None:
+        output_df = transformed_customers_df
+
+    else:
+        output_df = pd.merge(
+            desired_df,
+            transformed_customers_df[['customer_id', 'termination_date']],
+            on='customer_id',
+            how='inner'
+        )
 
     output_df['is_churn'] = (
     output_df['termination_date'] <= observed_date
     ).astype(int)
 
-    return output_df
+    return output_df['is_churn']
