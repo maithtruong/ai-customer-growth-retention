@@ -17,8 +17,33 @@
 # # About
 
 # %% [markdown]
-# - RFM Segmentation
-# - RFM and Churn Connection
+# This is an experimental notebook to model a Churn Classifier. The functions are in progress, so they are a bit messy at the start. Gradually as I modularize the code more, they become a bit more organized.
+#
+# I underwent the following steps:
+# - `Preparation`: Transform seed data format to be suitable for feature engineering.
+# - Feature Transformation
+#     - `Test Feature Transformation Pipeline 1`
+#         - `Feature Engineering`: Generate features using the following information:
+#             - Window Features
+#             - RFM Features
+#             - Activity Trend Features
+#                 - Slope
+#                 - Statistics
+#             - I gathered 106 features in total.
+#         - `Data Split`: Split data into train, test, val sets with dependent and independent variables.
+#         - `Feature Processing`: Transform features (impute, scale) then select features with good Mutual Information contribution.
+#         - `Write Transformation Models`: Temporarily dump the transformed dataframes and transformers so I can continue experimenting without having to rerun the notebook.
+#     - `Complete Feature Transformation Pipeline 1`: Wrap the entire Pipeline 1 into respective functions. Then write the dataframes and transformers again.
+# - `Model Test`: Try some Tree classifiers on one target. The results were horrendous (around 0.5 PR-AUC), so I wondered if raw features were better.
+# - `Test Feature Transformation Pipeline 2`: Instead of the transformed features, use the raw features to see if AUC is any better. Results: Similar results as transformed version.
+# -  `Log Results`:
+#     - Data Pipeline: Wrap the data pipelines above into callable functions that generates and writes down:
+#         - Raw features dataframes
+#         - Transformed features dataframes
+#         - Transformers (imputer, scaler, selected features)
+#     - Train & Log Models: Use mlflow to log models and metrics with the best performance for each target using different types of data.
+#         - Conclusion: AUC gets worse when the prediction window is larger. The model can not predict for 90 days at all. The transformed features are mostly better than the raw features and results in PR-AUC that is slightly better than random guessing (0.55)
+# - `Call Models`: Get the current production model for respective target for inference.
 
 # %% [markdown]
 # # Preparation
@@ -157,6 +182,17 @@ PREPROCESSING_REF_DIR = (
 )
 PREPROCESSING_REF_DIR.mkdir(parents=True, exist_ok=True)
 
+# %%
+mlflow.set_tracking_uri(f"file://{MLRUNS_DIR}")
+
+# %%
+print("Tracking URI:", mlflow.get_tracking_uri())
+
+# %%
+from mlflow.tracking import MlflowClient
+
+client = MlflowClient()
+
 
 # %% [markdown]
 # ## Custom Wrappers
@@ -218,191 +254,6 @@ def build_training_base(
     return transactions_modeling_df, customers_modeling_df
 
 
-# %%
-def get_rfm_window_features(customers_df, transactions_df, observed_date):
-
-    rfm_time_windows = ["all_time", "30d", "60d", "90d"]
-
-    for rfm_time_window in rfm_time_windows:
-
-        if rfm_time_window == "all_time":
-            filtered_transactions_df = transactions_df
-        else:
-            # Limit data to the new cutoff
-            days = int(rfm_time_window.strip("d"))
-            filtered_transactions_df = transactions_df[
-                (transactions_df['transaction_date'] <= observed_date - pd.Timedelta(days=days))
-            ]
-
-        # Get a Customers Screenshot Summary DataFrame. It has RFM features and other variables that RFM features depend on.
-        summary_modeling_df = get_customers_screenshot_summary_from_transactions_df(
-            transactions_df=filtered_transactions_df,
-            observed_date=observed_date,
-            column_names=["customer_id", "transaction_date", "amount"]
-        )
-
-        # Keep only customer_id and the RFM columns we care about
-        summary_modeling_df = summary_modeling_df[[
-            'customer_id',
-            'days_until_observed',
-            'period_transaction_count',
-            'period_total_amount',
-            'period_tenure_days'
-        ]]
-
-        # Rename columns in the summary DF, not the main DF
-        summary_modeling_df = summary_modeling_df.rename(columns={
-            'days_until_observed': f'rfm_recency_{rfm_time_window}',
-            'period_transaction_count': f'rfm_frequency_{rfm_time_window}',
-            'period_total_amount': f'rfm_monetary_{rfm_time_window}',
-            'period_tenure_days': f'tenure_{rfm_time_window}'
-        })
-        
-        # Merge with current data used for modelling.
-        customers_df = pd.merge(
-            customers_df,
-            summary_modeling_df,
-            on="customer_id",
-            how="left"
-        )
-
-    return customers_df
-
-
-# %%
-def get_slope_features(customers_df, transactions_df, observed_date, feature_list):
-
-    time_windows = ["all_time", "30d", "60d", "90d"]
-
-    for time_window in time_windows:
-
-        if time_window == "all_time":
-            filtered_transactions_df = transactions_df
-        else:
-            # Limit data to the new cutoff
-            days = int(time_window.strip("d"))
-            filtered_transactions_df = transactions_df[
-                (transactions_df['transaction_date'] <= observed_date - pd.Timedelta(days=days))
-            ]
-
-    customers_list = filtered_transactions_df['customer_id'].unique()
-
-    slopes = {}
-
-    for customer_id in customers_list:
-
-        customer_transactions = filtered_transactions_df[filtered_transactions_df['customer_id'] == customer_id]
-
-        x = np.arange(len(customer_transactions)) #time axis
-        slopes[customer_id] = {} #initiate value list
-
-        for feature_name in feature_list:
-            y = customer_transactions[feature_name].values
-            x_valid = x[~np.isnan(y)]
-            y_valid = y[~np.isnan(y)]
-
-            if len(y_valid) < 2:
-                slopes[customer_id][feature_name] = np.nan
-            else:
-                slope = np.polyfit(x_valid, y_valid, 1)[0]
-                slopes[customer_id][feature_name] = slope
-
-    # Convert dict of dicts into dataframe
-    slope_features_df = pd.DataFrame.from_dict(slopes, orient='index')
-
-    # Rename columns to have slope_ prefix
-    slope_features_df = slope_features_df.rename(columns={f: f'slope_{f}' for f in slope_features_df.columns})
-
-    # Reset index to have customer_id as a column
-    slope_features_df = slope_features_df.reset_index().rename(columns={'index': 'customer_id'})
-
-    # Merge with current data used for modelling.
-    customers_df = pd.merge(
-        customers_df,
-        slope_features_df,
-        on="customer_id",
-        how="left"
-    )
-
-    return customers_df
-
-
-# %%
-def get_transaction_statistics_features(customers_df, transactions_df, observed_date, feature_list):
-
-    time_windows = ["all_time", "30d", "60d", "90d"]
-
-    all_stats_df_list = []
-
-    for time_window in time_windows:
-
-        if time_window == "all_time":
-            filtered_transactions_df = transactions_df
-        else:
-            # Limit data to the new cutoff
-            days = int(time_window.strip("d"))
-            filtered_transactions_df = transactions_df[
-                (transactions_df['transaction_date'] <= observed_date - pd.Timedelta(days=days))
-            ]
-
-        customers_list = filtered_transactions_df['customer_id'].unique()
-        stats_dict = {}
-
-        for customer_id in customers_list:
-
-            customer_transactions = filtered_transactions_df[
-                filtered_transactions_df['customer_id'] == customer_id
-            ]
-
-            stats_dict[customer_id] = {}
-
-            for feature_name in feature_list:
-
-                y = customer_transactions[feature_name].dropna().values
-
-                if len(y) < 2:
-                    # Less than 2 observations -> return NaN for all stats
-                    stats_dict[customer_id][f"min_{feature_name}"] = np.nan
-                    stats_dict[customer_id][f"mean_{feature_name}"] = np.nan
-                    stats_dict[customer_id][f"mode_{feature_name}"] = np.nan
-                    stats_dict[customer_id][f"max_{feature_name}"] = np.nan
-                    for q in [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99]:
-                        stats_dict[customer_id][f"q{q}_{feature_name}"] = np.nan
-                    continue
-
-                # Compute stats
-                stats_dict[customer_id][f"min_{feature_name}"] = np.min(y)
-                stats_dict[customer_id][f"mean_{feature_name}"] = np.mean(y)
-
-                # Compute mode safely
-                mode_result = stats.mode(y, nan_policy='omit')
-                if hasattr(mode_result.mode, "__len__"):
-                    # old SciPy: mode is array
-                    mode_val = mode_result.mode[0] if len(mode_result.mode) > 0 else np.nan
-                else:
-                    # new SciPy: mode is scalar
-                    mode_val = mode_result.mode if mode_result.count > 0 else np.nan
-
-                stats_dict[customer_id][f"mode_{feature_name}"] = mode_val
-
-                stats_dict[customer_id][f"max_{feature_name}"] = np.max(y)
-
-                # Quantiles
-                for q in [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99]:
-                    stats_dict[customer_id][f"q{q}_{feature_name}"] = np.percentile(y, q)
-
-        # Convert to dataframe
-        stats_df = pd.DataFrame.from_dict(stats_dict, orient='index').reset_index().rename(columns={'index': 'customer_id'})
-        all_stats_df_list.append(stats_df)
-
-    # Merge with customers_df (only keep last time_window stats)
-    final_stats_df = all_stats_df_list[-1]  # or merge all windows if needed
-    customers_df = pd.merge(customers_df, final_stats_df, on='customer_id', how='left')
-
-    return customers_df
-
-
-
 # %% [markdown]
 # ### Helpers
 
@@ -450,32 +301,14 @@ def check_nan_in_df_cols(df):
 
 
 # %%
-def load_target_data(target: str):
-    target_dir = BASE_GOLD_DIR / target
+def save_X_csv(X_by_target, BASE_GOLD_DIR):
 
-    X_train = pd.read_csv(target_dir / "X_train.csv", index_col=0)
-    X_val   = pd.read_csv(target_dir / "X_val.csv", index_col=0)
-    X_test  = pd.read_csv(target_dir / "X_test.csv", index_col=0)
-
-    y_train = pd.read_csv(target_dir / "y_train.csv", index_col=0).squeeze()
-    y_val   = pd.read_csv(target_dir / "y_val.csv", index_col=0).squeeze()
-    y_test  = pd.read_csv(target_dir / "y_test.csv", index_col=0).squeeze()
-
-    return X_train, X_val, X_test, y_train, y_val, y_test
-
-
-# %%
-def save_X_csv(X_train_by_target, BASE_GOLD_DIR):
-
-    for target in X_train_by_target.keys():
+    for target in X_by_target.keys():
 
         target_dir = BASE_GOLD_DIR / target
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        # ----------------------------
-        # TRAIN
-        # ----------------------------
-        X_train_by_target[target].to_csv(
+        X_by_target[target].to_csv(
             target_dir / "X_train.csv",
             index=True,
         )
@@ -487,12 +320,8 @@ def save_X_csv(X_train_by_target, BASE_GOLD_DIR):
 
 # %%
 def save_y_csv(
-        X_train_by_target,
-        y_train,
-        X_test_by_target,
-        y_test,
-        X_val_by_target,
-        y_val,
+        X_by_target,
+        y,
         BASE_GOLD_DIR
     ):
 
@@ -503,34 +332,12 @@ def save_y_csv(
         # ----------------------------
         # TRAIN labels
         # ----------------------------
-        y_train.loc[
-            X_train_by_target[target].index, target
+        y.loc[
+            X_by_target[target].index, target
         ].to_csv(
             target_dir / "y_train.csv",
             header=True,
         )
-
-        # ----------------------------
-        # VALIDATION labels
-        # ----------------------------
-        y_val.loc[
-            X_val_by_target[target].index, target
-        ].to_csv(
-            target_dir / "y_val.csv",
-            header=True,
-        )
-
-        # ----------------------------
-        # TEST labels
-        # ----------------------------
-        y_test.loc[
-            X_test_by_target[target].index, target
-        ].to_csv(
-            target_dir / "y_test.csv",
-            header=True,
-        )
-
-        print(f"[{target}] y_train / y_val / y_test written")
     
     return "All data saved successfully."
 
@@ -565,7 +372,7 @@ def save_transformed_by_target_csv(X_by_target, split, base_gold_dir, index_name
 
 
 # %%
-def load_transformed(split, target):
+def load_transformed(BASE_GOLD_DIR, split, target):
     return pd.read_csv(
         BASE_GOLD_DIR / "transformed" / target / f"X_{split}.csv",
         index_col=0,
@@ -1155,6 +962,107 @@ def transform_and_select_for_multiple_targets_test(
     return X_by_target
 
 
+# %%
+def build_and_transform_for_multiple_targets(
+    transactions_modeling_df,
+    X_df,
+    observed_date,
+    numeric_imputer,
+    scaler,
+    selected_features_by_target,
+):
+    """
+    Build and transform customer features for multiple targets
+    (test / val / inference).
+
+    Returns
+    -------
+    X_by_target : dict[str, pd.DataFrame]
+    """
+
+    X_by_target = {}
+
+    for target, selected_features in selected_features_by_target.items():
+        X_by_target[target] = build_and_transform_customer_features_pipeline_test(
+            transactions_modeling_df=transactions_modeling_df,
+            X_test=X_df,
+            observed_date=observed_date,
+            numeric_imputer=numeric_imputer,
+            scaler=scaler,
+            selected_features=selected_features,
+            feature_list=[
+                "amount",
+                "days_since_previous_transaction",
+                "days_until_next_transaction",
+                "customer_transaction_order",
+                "days_since_first_transaction",
+            ],
+        )
+
+    return X_by_target
+
+
+# %%
+def transform_for_multiple_targets(
+    transactions_modeling_df,
+    X_df,
+    observed_date,
+    numeric_imputer,
+    scaler,
+    selected_features_by_target,
+):
+    """
+    Build and transform customer features for multiple targets
+    (test / val / inference).
+
+    Returns
+    -------
+    X_by_target : dict[str, pd.DataFrame]
+    """
+
+    X_by_target = {}
+
+    for target, selected_features in selected_features_by_target.items():
+        X_by_target[target] = transform_customers_numeric_features(
+            X_numeric,
+            numeric_imputer,
+            scaler,
+        )
+
+        select_features_per_target(
+            X_train_transformed_df,
+            y_train,
+            targets,
+            artifact_dir=None,
+            cutoff=0.0,
+            random_state=42,
+        )
+        
+        = build_and_transform_customer_features_pipeline_test(
+            transactions_modeling_df=transactions_modeling_df,
+            X_test=X_df,
+            observed_date=observed_date,
+            numeric_imputer=numeric_imputer,
+            scaler=scaler,
+            selected_features=selected_features,
+            feature_list=[
+                "amount",
+                "days_since_previous_transaction",
+                "days_until_next_transaction",
+                "customer_transaction_order",
+                "days_since_first_transaction",
+            ],
+        )
+
+    return X_by_target
+
+transform_customers_numeric_features(
+    X_numeric,
+    numeric_imputer,
+    scaler,
+)
+
+
 # %% [markdown]
 # ### Model
 
@@ -1413,6 +1321,152 @@ def train_lgbm(
 
 
 # %% [markdown]
+# ### Inference
+
+# %%
+def promote_to_production(run_id):
+    client.set_tag(run_id, "stage", "production")
+
+
+# %%
+def get_production_runs():
+    return mlflow.search_runs(
+        filter_string="tags.stage = 'production'",
+        search_all_experiments=True,
+        output_format="pandas",
+    )
+
+    return runs
+
+
+# %%
+def load_production_models():
+    prod_runs = get_production_runs()
+
+    models = {}
+    metadata = {}
+
+    for _, row in prod_runs.iterrows():
+        target = row["params.target"]
+        dataset_version = row["params.dataset_version"]
+        run_id = row["run_id"]
+
+        model_uri = f"runs:/{run_id}/{dataset_version}_{target}"
+        model = mlflow.lightgbm.load_model(model_uri)
+
+        models[target] = model
+        metadata[target] = {
+            "dataset_version": dataset_version,
+            "run_id": run_id,
+        }
+
+    return models, metadata
+
+
+# %%
+def get_customer_features(
+    customer_ids,
+    target,
+    metadata,
+    raw_features_df,
+    transformed_features_by_target,
+):
+    if isinstance(customer_ids, str):
+        customer_ids = [customer_ids]
+
+    dataset_version = metadata[target]["dataset_version"]
+
+    if dataset_version == "raw":
+        X = raw_features_df.loc[customer_ids]
+    elif dataset_version == "transformed":
+        X = transformed_features_by_target[target].loc[customer_ids]
+    else:
+        raise ValueError(f"Unknown dataset version: {dataset_version}")
+
+    return X
+
+
+# %%
+def predict_churn(
+    customer_id: str,
+    horizon_days: int,
+    raw_features_df,
+    transformed_features_by_target,
+    models,
+    metadata,
+):
+    # ------------------
+    # Validate horizon
+    # ------------------
+    if horizon_days not in {30, 60, 90}:
+        raise ValueError("horizon_days must be one of {30, 60, 90}")
+
+    target = f"is_churn_{horizon_days}_days"
+
+    if target not in models:
+        raise KeyError(f"No production model loaded for target: {target}")
+
+    # ------------------
+    # Select features
+    # ------------------
+    X = get_customer_features(
+        customer_ids=[customer_id],
+        target=target,
+        metadata=metadata,
+        raw_features_df=raw_features_df,
+        transformed_features_by_target=transformed_features_by_target,
+    )
+
+    # ------------------
+    # Predict
+    # ------------------
+    model = models[target]
+    churn_prob = float(model.predict_proba(X)[0, 1])
+
+    # ------------------
+    # Risk labeling (explicit, adjustable)
+    # ------------------
+    if churn_prob >= 0.7:
+        churn_label = "high_risk"
+    elif churn_prob >= 0.4:
+        churn_label = "medium_risk"
+    else:
+        churn_label = "low_risk"
+
+    return {
+        "churn_probability": round(churn_prob, 4),
+        "churn_label": churn_label,
+    }
+
+
+# %%
+def load_features(
+        dataset_version,
+        gold_data_version=MAX_DATA_DATE_STR,
+        gold_dir="default",
+        targets=targets
+    ):
+    '''
+        The service preloads the feature dataframes for faster search.
+    '''
+    if gold_dir == "default":
+        PROJECT_ROOT = Path.cwd().parent
+        gold_dir = PROJECT_ROOT / "data" / "gold" / gold_data_version
+    
+    if dataset_version == "raw":
+        feature_df = pd.read_csv(gold_dir / dataset_version / "all_features.csv", index_col=0)
+        return feature_df
+    elif dataset_version == "transformed":
+        X_by_target = {}
+        for target in targets:
+            feature_df = pd.read_csv(gold_dir / dataset_version / target / "X_all.csv", index_col=0)
+            X_by_target[target] = feature_df
+        return X_by_target
+    else:
+        return "Invalid dataset version. Please use only `raw` and `transformed`."
+
+
+# %% [markdown]
 # ## Data
 
 # %% [markdown]
@@ -1484,7 +1538,7 @@ for nday in ndays:
 # ## Feature Engineering
 
 # %% [markdown]
-# ### Transaction Features
+# ### Window Features
 
 # %% [markdown]
 # Adding more features to transactions data so I can compute dependency features:
@@ -1974,442 +2028,11 @@ dump(scaler, ARTIFACT_DIR / "scaler.joblib")
 with open(ARTIFACT_DIR / "selected_features1.json", "w") as f:
     json.dump(list(selected_features1), f)
 
-
 # %% [markdown]
 # # Complete Feature Transformation Pipeline 1
 
 # %% [markdown]
 # ## Wrapper
-
-# %%
-def add_transaction_time_features(transactions_df):
-    """
-    Add time-based and order-based transaction features.
-
-    Parameters
-    ----------
-    transactions_df : pd.DataFrame
-        Must contain: customer_id, transaction_date
-
-    Returns
-    -------
-    pd.DataFrame
-        Copy of transactions_df with added features
-    """
-
-    df = transactions_df.sort_values(
-        ["customer_id", "transaction_date"]
-    ).copy()
-
-    df["customer_transaction_order"] = (
-        df.groupby("customer_id").cumcount()
-    )
-
-    df["prev_transaction_date"] = (
-        df.groupby("customer_id")["transaction_date"].shift(1)
-    )
-
-    df["next_transaction_date"] = (
-        df.groupby("customer_id")["transaction_date"].shift(-1)
-    )
-
-    df["days_since_previous_transaction"] = (
-        df["transaction_date"] - df["prev_transaction_date"]
-    ).dt.days
-
-    df["days_until_next_transaction"] = (
-        df["next_transaction_date"] - df["transaction_date"]
-    ).dt.days
-
-    df["first_transaction_date"] = (
-        df.groupby("customer_id")["transaction_date"]
-        .transform("min")
-    )
-
-    df["days_since_first_transaction"] = (
-        df["transaction_date"] - df["first_transaction_date"]
-    ).dt.days
-
-    return df
-
-
-# %%
-def build_customer_features(
-    transactions_modeling_df,
-    customers_modeling_df,
-    observed_date,
-    feature_list=[
-        "amount",
-        "days_since_previous_transaction",
-        "days_until_next_transaction",
-        "customer_transaction_order",
-        "days_since_first_transaction",
-    ],
-):
-    """
-    Build raw customer-level features from transactions and customers data.
-    No imputing, scaling, or selection is performed here.
-    """
-
-    # 1. Transaction-level features
-    transactions_df = add_transaction_time_features(
-        transactions_modeling_df
-    )
-
-    # 2. RFM window features
-    customers_df = get_rfm_window_features(
-        customers_df=customers_modeling_df,
-        transactions_df=transactions_df,
-        observed_date=observed_date,
-    )
-
-    # 3. Activity trend (slopes)
-    customers_df = get_slope_features(
-        customers_df=customers_df,
-        transactions_df=transactions_df,
-        observed_date=observed_date,
-        feature_list=feature_list,
-    )
-
-    # 4. Transaction statistics
-    customers_df = get_transaction_statistics_features(
-        customers_df=customers_df,
-        transactions_df=transactions_df,
-        observed_date=observed_date,
-        feature_list=feature_list,
-    )
-
-    return customers_df
-
-
-# %%
-def fit_numeric_transformers(
-    X_train_numeric_df,
-    imputer_params=None,
-    scaler_params=None,
-):
-    """
-    Fit numeric imputer and scaler on training data only.
-
-    Returns
-    -------
-    X_train_numeric_imputed_scaled_df : pd.DataFrame
-    numeric_imputer : fitted IterativeImputer
-    scaler : fitted StandardScaler
-    """
-
-    # -------------------------------
-    # Defaults
-    # -------------------------------
-    if imputer_params is None:
-        imputer_params = dict(
-            estimator=LinearRegression(),
-            max_iter=20,
-            random_state=42,
-        )
-
-    if scaler_params is None:
-        scaler_params = {}
-
-    # -------------------------------
-    # Imputation (FIT)
-    # -------------------------------
-    numeric_imputer = IterativeImputer(**imputer_params)
-    X_train_numeric_imputed = numeric_imputer.fit_transform(X_train_numeric_df)
-
-    X_train_numeric_imputed_df = pd.DataFrame(
-        X_train_numeric_imputed,
-        columns=X_train_numeric_df.columns,
-        index=X_train_numeric_df.index,
-    )
-
-    # -------------------------------
-    # Scaling (FIT)
-    # -------------------------------
-    scaler = StandardScaler(**scaler_params)
-    X_train_numeric_imputed_scaled = scaler.fit_transform(
-        X_train_numeric_imputed_df
-    )
-
-    X_train_numeric_imputed_scaled_df = pd.DataFrame(
-        X_train_numeric_imputed_scaled,
-        columns=X_train_numeric_df.columns,
-        index=X_train_numeric_df.index,
-    )
-
-    return (
-        numeric_imputer,
-        scaler,
-    )
-
-
-# %%
-def transform_customers_numeric_features(
-    X_numeric,
-    numeric_imputer,
-    scaler,
-):
-    """
-    Apply fitted numeric imputer and scaler.
-    """
-
-    X_numeric_imputed = numeric_imputer.transform(X_numeric)
-    X_numeric_imputed_df = pd.DataFrame(
-        X_numeric_imputed,
-        columns=X_numeric.columns,
-        index=X_numeric.index,
-    )
-
-    X_numeric_scaled = scaler.transform(X_numeric_imputed_df)
-    X_numeric_scaled_df = pd.DataFrame(
-        X_numeric_scaled,
-        columns=X_numeric.columns,
-        index=X_numeric.index,
-    )
-
-    return X_numeric_scaled_df
-
-
-
-# %%
-def split_features_targets(
-    customers_modeling_df,
-    targets,
-    test_size=0.33,
-    val_size=0.33,
-    random_state=42,
-):
-    """
-    Split customer modeling dataframe into train / val / test sets.
-
-    Parameters
-    ----------
-    customers_modeling_df : pd.DataFrame
-        Must contain customer_id and target columns.
-    targets : list[str]
-        Target column names.
-    test_size : float
-        Proportion of data used for test+val split.
-    val_size : float
-        Proportion of test split used for validation.
-    random_state : int
-
-    Returns
-    -------
-    X_train, X_val, X_test, y_train, y_val, y_test
-    """
-
-    # -------------------------------
-    # Feature / target separation
-    # -------------------------------
-    X_df = customers_modeling_df.drop(columns=targets)
-    X_df = X_df.set_index("customer_id", drop=True)
-
-    y_df = customers_modeling_df[["customer_id"] + targets]
-    y_df = y_df.set_index("customer_id", drop=True)
-
-    # -------------------------------
-    # Train / temp split
-    # -------------------------------
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X_df,
-        y_df,
-        test_size=test_size,
-        random_state=random_state,
-    )
-
-    # -------------------------------
-    # Test / validation split
-    # -------------------------------
-    X_test, X_val, y_test, y_val = train_test_split(
-        X_temp,
-        y_temp,
-        test_size=val_size,
-        random_state=random_state,
-    )
-
-    return X_train, X_val, X_test, y_train, y_val, y_test
-
-
-# %%
-def build_and_transform_customer_features_pipeline_test(
-    transactions_modeling_df,
-    X_test,
-    observed_date,
-    numeric_imputer,
-    scaler,
-    selected_features,
-    feature_list=[
-        "amount",
-        "days_since_previous_transaction",
-        "days_until_next_transaction",
-        "customer_transaction_order",
-        "days_since_first_transaction",
-    ],
-):
-    """
-    End-to-end pipeline for TEST / VAL / INFERENCE data.
-
-    Steps
-    -----
-    1. Build raw customer-level features from transactions
-    2. Remove customer_id from feature space
-    3. Apply fitted numeric transformations (imputer + scaler)
-    4. Select precomputed feature subset (STRICT reuse)
-    """
-
-    # --------------------------------------------------
-    # 1. Build raw customer features
-    # --------------------------------------------------
-    X_test_features_df = build_customer_features(
-        transactions_modeling_df=transactions_modeling_df,
-        customers_modeling_df=X_test,
-        observed_date=observed_date,
-        feature_list=feature_list,
-    )
-
-    # --------------------------------------------------
-    # 2. Set customer_id as index and REMOVE from features
-    # --------------------------------------------------
-    if "customer_id" not in X_test_features_df.columns:
-        raise ValueError("customer_id column missing after feature building")
-
-    X_test_features_df = X_test_features_df.set_index("customer_id", drop=True)
-
-    # --------------------------------------------------
-    # 3. Select numeric features and enforce column order
-    # --------------------------------------------------
-    X_test_numeric_features_df = X_test_features_df.select_dtypes(include="number")
-
-    # Enforce training-time column order (critical for IterativeImputer)
-    X_test_numeric_features_df = X_test_numeric_features_df[
-        numeric_imputer.feature_names_in_
-    ]
-
-    # --------------------------------------------------
-    # 4. Apply fitted numeric transformations (NO FIT)
-    # --------------------------------------------------
-    X_test_numeric_features_transformed_df = transform_customers_numeric_features(
-        X_test_numeric_features_df,
-        numeric_imputer,
-        scaler,
-    )
-
-    # --------------------------------------------------
-    # 5. Feature selection (STRICT reuse)
-    # --------------------------------------------------
-    missing_features = set(selected_features) - set(
-        X_test_numeric_features_transformed_df.columns
-    )
-    if missing_features:
-        raise ValueError(
-            f"Missing selected features at inference time: {missing_features}"
-        )
-
-    X_test_final_df = X_test_numeric_features_transformed_df[selected_features]
-
-    return X_test_final_df
-
-
-# %%
-def build_and_transform_for_multiple_targets(
-    transactions_modeling_df,
-    X_df,
-    observed_date,
-    numeric_imputer,
-    scaler,
-    selected_features_by_target,
-):
-    """
-    Build and transform customer features for multiple targets
-    (test / val / inference).
-
-    Returns
-    -------
-    X_by_target : dict[str, pd.DataFrame]
-    """
-
-    X_by_target = {}
-
-    for target, selected_features in selected_features_by_target.items():
-        X_by_target[target] = build_and_transform_customer_features_pipeline_test(
-            transactions_modeling_df=transactions_modeling_df,
-            X_test=X_df,
-            observed_date=observed_date,
-            numeric_imputer=numeric_imputer,
-            scaler=scaler,
-            selected_features=selected_features,
-            feature_list=[
-                "amount",
-                "days_since_previous_transaction",
-                "days_until_next_transaction",
-                "customer_transaction_order",
-                "days_since_first_transaction",
-            ],
-        )
-
-    return X_by_target
-
-
-# %%
-def transform_for_multiple_targets(
-    transactions_modeling_df,
-    X_df,
-    observed_date,
-    numeric_imputer,
-    scaler,
-    selected_features_by_target,
-):
-    """
-    Build and transform customer features for multiple targets
-    (test / val / inference).
-
-    Returns
-    -------
-    X_by_target : dict[str, pd.DataFrame]
-    """
-
-    X_by_target = {}
-
-    for target, selected_features in selected_features_by_target.items():
-        X_by_target[target] = transform_customers_numeric_features(
-            X_numeric,
-            numeric_imputer,
-            scaler,
-        )
-
-        select_features_per_target(
-            X_train_transformed_df,
-            y_train,
-            targets,
-            artifact_dir=None,
-            cutoff=0.0,
-            random_state=42,
-        )
-        
-        = build_and_transform_customer_features_pipeline_test(
-            transactions_modeling_df=transactions_modeling_df,
-            X_test=X_df,
-            observed_date=observed_date,
-            numeric_imputer=numeric_imputer,
-            scaler=scaler,
-            selected_features=selected_features,
-            feature_list=[
-                "amount",
-                "days_since_previous_transaction",
-                "days_until_next_transaction",
-                "customer_transaction_order",
-                "days_since_first_transaction",
-            ],
-        )
-
-    return X_by_target
-
-transform_customers_numeric_features(
-    X_numeric,
-    numeric_imputer,
-    scaler,
-)
 
 # %% [markdown]
 # ## Resplit Data
@@ -2554,7 +2177,7 @@ for target in targets:
 # Instead of running this pipeline again, I will just read the existing sets.
 
 # %% [markdown]
-# # Train
+# # Model Test
 
 # %% [markdown]
 # ## Test on is_churn_30_days
@@ -2900,7 +2523,6 @@ kl_df['KL_divergence'].describe()
 # ## MLflow setup
 
 # %%
-mlflow.set_tracking_uri(f"file://{MLRUNS_DIR}")
 mlflow.set_experiment(EXPERIMENT_NAME)
 
 # %% [markdown]
@@ -3034,6 +2656,20 @@ save_raw_features_csv(
 )
 
 # %%
+# Merge the dataset so inference is easier.
+'''
+temp_df = pd.concat(
+    [
+        X_train_raw_features_df,
+        X_test_raw_features_df,
+        X_val_raw_features_df
+    ]
+)
+
+temp_df.to_csv(BASE_GOLD_DIR / "raw" / "all_features.csv", index=True)
+'''
+
+# %%
 # -----------------------------
 # TRANSFORMED FEATURES (by target)
 # -----------------------------
@@ -3054,6 +2690,26 @@ save_transformed_by_target_csv(
     split="test",
     base_gold_dir=BASE_GOLD_DIR,
 )
+
+# %%
+# Merge the dataset so inference is easier.
+'''
+for target in targets:
+
+    test_df = pd.read_csv(BASE_GOLD_DIR / "transformed" / target / "X_test.csv", index_col=0)
+    train_df = pd.read_csv(BASE_GOLD_DIR / "transformed" / target / "X_train.csv", index_col=0)
+    val_df = pd.read_csv(BASE_GOLD_DIR / "transformed" / target / "X_val.csv", index_col=0)
+
+    temp_df = pd.concat(
+        [
+            train_df,
+            test_df,
+            val_df
+        ]
+    )
+
+    temp_df.to_csv(BASE_GOLD_DIR / "transformed" / target / "X_all.csv", index=True)
+'''
 
 # %%
 joblib.dump(
@@ -3191,3 +2847,52 @@ for dataset_version, X_tr, X_v in [
 # - 90 days: Both models performed worse than random guessing.
 #
 # ![image.png](attachment:image.png)
+
+# %% [markdown]
+# # Call Models
+
+# %% [markdown]
+# ## Promote to Production
+
+# %%
+## 30 days - Transformed Features
+promote_to_production('7051a7a96e0442a8b9904bb8f05163c3')
+## 60 days - Transformed Features
+promote_to_production('85216ba359d243949e4acefd87fd1eed')
+## 90 days - Raw Features
+promote_to_production('43363f7766614a26b74485d845e90c28')
+
+# %% [markdown]
+# ## Load Data and Models
+
+# %%
+raw_features_df = load_features("raw")
+
+# %%
+transformed_features_by_target = load_features("transformed")
+
+# %%
+models, metadata = load_production_models()
+
+# %% [markdown]
+# ## Inference
+
+# %%
+predict_churn(
+    customer_id="C01552",
+    horizon_days=30,
+    raw_features_df=raw_features_df,
+    transformed_features_by_target=transformed_features_by_target,
+    models=models,
+    metadata=metadata
+)
+
+# %%
+predict_churn(
+    customer_id="C01553",
+    horizon_days=30,
+    raw_features_df=raw_features_df,
+    transformed_features_by_target=transformed_features_by_target,
+    models=models,
+    metadata=metadata
+)
