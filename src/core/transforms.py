@@ -8,6 +8,7 @@ and CLV models.
 
 import pandas as pd
 from typing import Optional
+from sklearn.model_selection import train_test_split
 
 def transform_transactions_df(transactions_df):
 
@@ -125,4 +126,63 @@ def add_churn_status(
     output_df['termination_date'] <= observed_date
     ).astype(int)
 
-    return output_df['is_churn']
+    #return output_df['is_churn']
+    return output_df
+
+def split_train_test_val(
+    customers_modeling_df,
+    targets,
+    test_size=0.33,
+    val_size=0.33,
+    random_state=42,
+):
+    """
+    Split customer modeling dataframe into train / val / test sets.
+
+    Parameters
+    ----------
+    customers_modeling_df : pd.DataFrame
+        Must contain customer_id and target columns.
+    targets : list[str]
+        Target column names.
+    test_size : float
+        Proportion of data used for test+val split.
+    val_size : float
+        Proportion of test split used for validation.
+    random_state : int
+
+    Returns
+    -------
+    X_train, X_val, X_test, y_train, y_val, y_test
+    """
+
+    # -------------------------------
+    # Feature / target separation
+    # -------------------------------
+    X_df = customers_modeling_df.drop(columns=targets)
+    X_df = X_df.set_index("customer_id", drop=True)
+
+    y_df = customers_modeling_df[["customer_id"] + targets]
+    y_df = y_df.set_index("customer_id", drop=True)
+
+    # -------------------------------
+    # Train / temp split
+    # -------------------------------
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X_df,
+        y_df,
+        test_size=test_size,
+        random_state=random_state,
+    )
+
+    # -------------------------------
+    # Test / validation split
+    # -------------------------------
+    X_test, X_val, y_test, y_val = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=val_size,
+        random_state=random_state,
+    )
+
+    return X_train, X_val, X_test, y_train, y_val, y_test
