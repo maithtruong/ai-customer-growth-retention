@@ -15,6 +15,7 @@ def transform_transactions_df(transactions_df):
     transactions_df['transaction_date'] = pd.to_datetime(transactions_df['transaction_date'])
     
     return transactions_df
+
 def transform_customers_df(customers_df):
 
     customers_df['signup_date'] = pd.to_datetime(customers_df['signup_date'])
@@ -123,7 +124,7 @@ def add_churn_status(
         )
 
     output_df['is_churn'] = (
-    output_df['termination_date'] <= observed_date
+        output_df['termination_date'] <= observed_date
     ).astype(int)
 
     #return output_df['is_churn']
