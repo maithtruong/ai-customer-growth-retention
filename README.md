@@ -1,37 +1,71 @@
-# AI Customer Growth & Retention
+<img width="1199" height="474" alt="image" src="https://github.com/user-attachments/assets/d22d5b4f-1959-4c49-932d-d02e36cc371d" /># AI Customer Growth & Retention
 *(Documentation in progress…)*
 
-This project explores **customer churn, survival, and customer lifetime value (CLV)** using transactional data from a fintech / subscription / e-commerce setting.
-
-The focus is not just on building models, but on **understanding customer behavior and using models to make better retention decisions**.
+Hello, welcome to "AI Customer Growth Retention", a final project for the course with the same title at Cole.vn, lectured by the amazing Dr. Le Thien Hoa (it's an honour to be in his class).
+This project aims to model **customer churn, survival, and customer lifetime value (CLV)** using transactional data from a e-commerce setting. By using different models and benchmarking them, we can select valuable customers to devote our limited budget to.
 
 This repo is currently on the **`exp` branch**, which is used for experimentation with notebooks and modeling pipelines.  
 A future **`prod` branch** will clean up the codebase, modularize logic, and add a simple UI.
 
 ---
 
-## Business Problem
+## Setup
+This branch is for experimentation. Because the notebooks are experimental, they are quite chaotic. They document the whole process that I went through, with some back and forth modifications, and are likely not completely reproducible. If you want to run the notebooks yourself:
+- Notebooks 00 to 05: only run the Libraries, Wrappers setups and the code to load the models.
+- Notebooks 06: the entire notebook should be reproducible, because they only call existing datasets and models in the repository.
+The work to tidy them up is in progress.
+
+## Requirements
+
+### Business Problem
 
 The company faces three common problems:
-
 - Customer acquisition cost (CAC) is increasing
 - High-value customers are churning
 - Retention campaigns are sent to everyone → expensive and low ROI
 
 The goal is to answer:
-
 > **If we can only retain 20% of customers, which 20% should we choose, and why?**
 
 ---
 
+### Technical Requirements
+
+The class lecturer requires the following tasks to be completed:
+- Perform RFM segmentation and analysis.
+- Create features, train, evaluate and benchmark the following models:
+  - Churn Classifier (Logistic / Tree).
+  - BG/NBD.
+  - Survival Models (Cox, Weibull).
+  - CLV Modeling (Gamma-Gamma with Churn Classifier or Survival Models).
+- Present model predictions as callable functions to be used in production.
+- Choose a strategy to retain top customers & explain the choice of method.
+
+---
+
+## Workflow
+Because this branch is mostly for experimentation, I have planned a linear workflow. I work on each notebooks in the folder /notebooks individually, in this order:
+- 00_eda.ipynb: Perform EDA to understand the data context.
+- 01_rfm.ipynb: Perform RFM segmentation and analysis.
+- 02_churn_classification.ipynb: Feature engineering, training, and evaluating LBGM models for **is_churn_30_days**, **is_churn_60_days** and **is_churn_90_days** targets.
+- 02_churn_classification_ver2.ipynb: Feature engineering, training, and evaluating LBGM models for **is_churn_1_days** target. I wanted to try benchmark LGBM results to that of BG/NBD (shows instant churn rate).
+- 03_bg_nbd.ipynb: Feature engineering, training, and evaluating LBGM models for targets **p_churn** (immediate churn) and **n_purchase_30d** (expected number of purchases in 30 days). Technically the requirement did not specify predicting expected number of purchases in **30 days**, but I wanted to benchmark its results with other models.
+- 04_survival_analysis.ipynb: Feature engineering, training, and evaluating Survival models (Cox, Weibull) for **is_churn_30_days** target. Technically the requirement did not specify predicting churn probabilty in **30 days**, but I wanted to benchmark its results with other models.
+- 05_clv_modeling.ipynb: Feature engineering, training, and evaluating Gamma-Gamma models for **pred_CLV_30d** (predicted Customer Value in 30 days) target. Benchmark test between BG/NBD and Survival approach, the Survival approach shows better results so I logged the Gamma-Gamma version that is combined with the Survival model.
+- 06_customer_prioritization.ipynb: Call the loaded models, perform inference on customers, prioritize customers using different strategies and compare the results.
+  
+There are .py files with the same name as the .ipynb files in the notebooks/ folder, they are actually parallel files to easier track changes made in the .ipynb files.
+After conducting experiments, the next step is to modularize the code into one Python module for better reproducibility.
+
 ## Dataset
 
-**Source**  
+**Original Source**  
 https://drive.google.com/drive/folders/1W13sZcd0cido1k5k1RuvHXjJzcvKQLic
+The data on data/seed is also the source data.
 
 **Files**
-- `Transactions.csv`
-- `Customers.csv`
+- `Transactions.csv`: Customer transactions. Include customer_id, transaction_date, and amount.
+- `Customers.csv`: Customer subscription information. Include customer_id, signup_date and true_lifetime_days.
 
 **Important**
 - There is **no churn label** provided.
@@ -41,78 +75,119 @@ https://drive.google.com/drive/folders/1W13sZcd0cido1k5k1RuvHXjJzcvKQLic
 
 ## Repository Structure
 
+Here is the first repository level:
+
 ai-customer-growth-retention/
-│
 ├── data/
-│ └── gold/31_12_2025/
-│ ├── raw/
-│ ├── transformed/
-│ ├── reference/
-│ ├── target/
-│ ├── inference/
-│ └── clv/
-│
 ├── notebooks/
-│ ├── 00_eda.ipynb
-│ ├── 01_rfm.ipynb
-│ ├── 02_churn_classification.ipynb
-│ ├── 03_bg_nbd.ipynb
-│ ├── 04_survival_analysis.ipynb
-│ ├── 05_clv_modeling.ipynb
-│ └── 06_customer_prioritization.ipynb
-│
-├── src/
-│ └── feature engineering, models, utilities
-│
-├── mlruns/ # MLflow experiments
-├── docs/ # Notes & explanations (WIP)
+├── src/ # Callable Python fucntions for feature engineering, models, utilities
+├── mlruns/ # MLflow experiments and models
+├── docs/ # Notes & explanations
 ├── .env
 ├── pyproject.toml
 └── README.md
 
+Here is the data folder:
+data/
+├── archive/
+├── gold/31_12_2025/
+│   ├── cut_1d/
+│   │   └── features/
+│   │       └── classifier/
+│   │           ├── raw/
+│   │           ├── target/
+│   │           └── transformed/
+│   ├── cut_30d/
+│   │   ├── features/
+│   │   │   ├── bgnbd/
+│   │   │   │   ├── raw/
+│   │   │   │   └── target/
+│   │   │   ├── classifier/
+│   │   │   │   ├── raw/
+│   │   │   │   ├── target/
+│   │   │   │   └── transformed/
+│   │   │   └── clv/
+│   │   │       ├── bgf_gg/
+│   │   │       └── survival_gg/
+│   │   └── inference/
+│   │       └── churn_classifier_targets.csv
+│   └── cut_120d/
+│       ├── features/
+│       │   └── classifier/
+│       │       ├── raw/
+│       │       ├── target/
+│       │       └── transformed/
+│       └── inference/
+├── seed/
+│   ├── customers.csv
+│   └── transactions.csv
 
-### Notebook Order
-
-The notebooks are meant to be read **in order**:
-
-1. `00_eda` – Explore data and validate assumptions  
-2. `01_rfm` – RFM features and customer segmentation  
-3. `02_churn_classification` – Binary churn prediction  
-4. `03_bg_nbd` – Probabilistic churn with BG-NBD  
-5. `04_survival_analysis` – Time-to-churn modeling  
-6. `05_clv_modeling` – CLV estimation  
-7. `06_customer_prioritization` – Retention strategy comparison  
+Where gold/<date> is the date where data is recorded. Because I was provided with one dataset whose end date is on 30/12/2025, there is only one sub folder titled as such.
+cut_{number}d is the data where its observations in the last {number} days are removed when training. Ex: cut_30d includes features built only on the data before the last 30 days of the dataset on 30/12/2025. The target folder in each cut is usually built using the remaining data (in the above example, labels built from the last 30 days of the data). They are split this way to create real labels for model evaluation.
 
 ---
 
-## Project Breakdown
+## Project Analysis
 
 ### 1. Customer Value Foundations (RFM)
 
+**Requirements**
 - Compute RFM metrics
 - Segment customers:
   - High-value / At-risk
   - New / Loyal / Hibernating
 - Analyze relationship between RFM and churn
 
+**Process**
+- Aggregate customer features using transactions dataset.
+- EDA on the aggregated set to see if quantile binning is possible.
+- Use quantile binning to seperate Recency, Frequency and Monetary (RMF) values to 5 groups.
+- Label customer based on assigned RFM scores.
+- Assign a simple priority score based on RFM scores.
+- Evaluate the outcomes of the assigned customer groups.
+
 **Takeaway**  
-RFM gives intuition, but it is not enough for predicting future behavior.
+- Pros: Simple, can be a quick way to prioritize customers.
+- Cons:
+  - Inaccurate
+      - RFM segmentation definitions are very abstract. We only use distributions to assign into scores, without looking at the TRUE lifetime of a customer. This means: at the time of segmentation, some customers have ALREADY died -> can not save anymore. (In fact, in this dataset, 
+  - Insufficient
+      - RFM segmetation ignores churn status and churn risk. And even if we use mean weighted scores (weighted on group size) for ranking priority customer groups, the score treats each criteria in RFM as the same. However, it has been stated before that Recency is the most important aspect in RFM (ref: Visualizing RFM Segmentation), because it shows whether the customer can be saved/ are they still here with our business.
+      - RFM segmentation also doesn't provide clear actions. It doesn't provide an uplift effect -> doesn't know who needs saving more -> it mistakingly place higher priority to Champions and Loyal Customers, when these customer groups likely do not need saving! (While the ones that need saving have already churned).
+  - Short-term vision
+      - RFM segmentation can't look ahead. It uses distributions as a base (when we are not sure about manual the definition of each score). However, with each observation time the distribution can SHIFT.
+      - Example: In this period, median recency is 40. Which means any recency larger than 40 already sounds pretty bad. Then in another period (6 months later), let's say our service made a bad choice, that disappointed our customers and more people haven't bought in a while. The whole distribution of recency shifts to the left. Now, the median is 70! So any customers with recency after this threshold is risky, but also customers before that new threshold. Instead, RFM just treats the most extreme values of recency as risky, which is dangerous.
+      - If we listen to RFM:
+          - Instead of trying to save people with recency of 40 people, we ended up only trying to save people with extreme recency. These people with 40 recency are untreated and will churn eventually -> the business lose the customers and the money.
+          - The people with extreme recency are likely beyond saving -> We waste money trying to save them.
+       
+Hence, a model that can predict a churn risk is necessary for better customer retention efforts.
 
 ---
 
 ### 2. Churn Prediction (Classification)
 
-**Goal**  
-Predict whether a customer will churn in the next **T days**.
+**Requirements**  
+  Define churn label (30 / 60 / 90 ngày)
+  Feature engineering:
+  - RFM
+  - Frequency trend
+  Train model (Logistic / Tree)
 
-**Steps**
+Deliverable
+  AUC, Precision–Recall
+  Confusion matrix
+  Top features
+
+**Process**
 - Define churn labels (30 / 60 / 90 days)
 - Feature engineering:
-  - RFM
-  - Frequency trends
-- Models:
-  - Logistic Regression
-  - Tree-based models
+  - Feature generation
+  - Feature transformation
+
+<img width="1199" height="474" alt="image" src="https://github.com/user-attachments/assets/fef744ed-cf71-4563-b148-3d3bf210cb6e" />
+
+<updating Docs ...>
 
 **Evaluation**
 - ROC-AUC
