@@ -1,0 +1,14 @@
+artifact_uri: file:///home/hong-mai/Desktop/HONGMAI/Coding/ai-customer-growth-retention/mlruns/737770009944063194/76c20174cc8845a19f6ff6023d7112f2/artifacts
+end_time: 1768997251018
+entry_point_name: ''
+experiment_id: '737770009944063194'
+lifecycle_stage: active
+run_id: 76c20174cc8845a19f6ff6023d7112f2
+run_name: gamma_gamma__pen0.0
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1768997250786
+status: 3
+tags: []
+user_id: hong-mai

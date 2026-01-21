@@ -1418,10 +1418,10 @@ def load_production_models():
 
 
 # %%
-def load_prod_bg_nbd():
-    exp = mlflow.get_experiment_by_name("bg-nbd")
+def load_bg_nbd_model(exp_name="customer_activity_modeling"):
+    exp = mlflow.get_experiment_by_name(exp_name)
     if exp is None:
-        raise ValueError("Experiment 'bg-nbd' not found")
+        raise ValueError(f"Experiment {exp_name} not found")
 
     runs = mlflow.search_runs(
         experiment_ids=[exp.experiment_id],
@@ -1445,12 +1445,14 @@ def load_prod_bg_nbd():
     }
 
     with tempfile.TemporaryDirectory() as d:
-        path = mlflow.artifacts.download_artifacts(
+        local_path = mlflow.artifacts.download_artifacts(
             run_id=run_id,
-            artifact_path="bg_nbd_model/bg_nbd.pkl",
+            artifact_path="model/model.pkl",
             dst_path=d,
         )
-        model = cloudpickle.load(open(path, "rb"))
+
+        with open(local_path, "rb") as f:
+            model = cloudpickle.load(f)
 
     return model, metadata
 
@@ -3210,7 +3212,7 @@ def load_models_once():
         return  # already loaded
 
     MODEL_STORE["ggf"], MODEL_STORE["ggf_meta"] = load_gamma_gamma_model()
-    MODEL_STORE["bgf"], MODEL_STORE["bgf_meta"] = load_prod_bg_nbd()
+    MODEL_STORE["bgf"], MODEL_STORE["bgf_meta"] = load_bg_nbd_model()
     MODEL_STORE["survival"], MODEL_STORE["survival_meta"] = load_survival_analysis_model()
 
 
@@ -3658,7 +3660,9 @@ for penalizer in param_grid["penalizer_coef"]:
 
     with mlflow.start_run(run_name=run_name):
 
-        mlflow.log_param("dataset_version", f"{OBSERVED_DATE_STR}__cut_30d")
+        mlflow.log_param("dataset_type", "survival_gg/transformed")
+        mlflow.log_param("dataset_version", f"{OBSERVED_DATE_STR}")
+        mlflow.log_param("dataset_cut", "cut_30d")
 
         train_gamma_gamma(
             X_train=X_train_survival_transformed,
@@ -3674,7 +3678,7 @@ for penalizer in param_grid["penalizer_coef"]:
 # ## Choose production model
 
 # %%
-promote_to_production("4973afd5021a4ddcaeebdae44c07540a")
+promote_to_production("76c20174cc8845a19f6ff6023d7112f2")
 
 # %%
 ggf, ggf_metadata = load_gamma_gamma_model()
@@ -3683,7 +3687,7 @@ ggf, ggf_metadata = load_gamma_gamma_model()
 survival_model, survival_model_metadata = load_survival_analysis_model()
 
 # %%
-bgf, bgf_metadata = load_prod_bg_nbd()
+bgf, bgf_metadata = load_bg_nbd_model()
 
 # %% [markdown]
 # ## Inference

@@ -1,0 +1,14 @@
+artifact_uri: file:///home/hong-mai/Desktop/HONGMAI/Coding/ai-customer-growth-retention/mlruns/531504688615697597/0a7e2b27c0cd40d8964eef8e19a01dca/artifacts
+end_time: 1768997037682
+entry_point_name: ''
+experiment_id: '531504688615697597'
+lifecycle_stage: active
+run_id: 0a7e2b27c0cd40d8964eef8e19a01dca
+run_name: weibull__h30__p1.0__l10.0
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1768997036068
+status: 3
+tags: []
+user_id: hong-mai

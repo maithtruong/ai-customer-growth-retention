@@ -1,0 +1,130 @@
+artifact_path: file:///home/hong-mai/Desktop/HONGMAI/Coding/ai-customer-growth-retention/mlruns/741131578962042523/models/m-f8303059f3934b49a362283cdf6e5d85/artifacts
+flavors:
+  lightgbm:
+    code: null
+    data: model.pkl
+    lgb_version: 4.6.0
+    model_class: lightgbm.sklearn.LGBMClassifier
+  python_function:
+    data: model.pkl
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.lightgbm
+    python_version: 3.12.3
+is_signature_from_type_hint: false
+mlflow_version: 3.2.0
+model_id: m-f8303059f3934b49a362283cdf6e5d85
+model_size_bytes: 715523
+model_uuid: m-f8303059f3934b49a362283cdf6e5d85
+prompts: null
+run_id: a039c10b2d2f4d3f808d06d6a2215ebf
+saved_input_example_info:
+  artifact_path: input_example.json
+  pandas_orient: split
+  serving_input_path: serving_input_example.json
+  type: dataframe
+signature:
+  inputs: '[{"type": "long", "name": "rfm_recency_all_time", "required": true}, {"type":
+    "long", "name": "rfm_frequency_all_time", "required": true}, {"type": "double",
+    "name": "rfm_monetary_all_time", "required": true}, {"type": "long", "name": "tenure_all_time",
+    "required": true}, {"type": "double", "name": "rfm_recency_30d", "required": false},
+    {"type": "double", "name": "rfm_frequency_30d", "required": false}, {"type": "double",
+    "name": "rfm_monetary_30d", "required": false}, {"type": "double", "name": "tenure_30d",
+    "required": false}, {"type": "double", "name": "rfm_recency_60d", "required":
+    false}, {"type": "double", "name": "rfm_frequency_60d", "required": false}, {"type":
+    "double", "name": "rfm_monetary_60d", "required": false}, {"type": "double", "name":
+    "tenure_60d", "required": false}, {"type": "double", "name": "rfm_recency_90d",
+    "required": false}, {"type": "double", "name": "rfm_frequency_90d", "required":
+    false}, {"type": "double", "name": "rfm_monetary_90d", "required": false}, {"type":
+    "double", "name": "tenure_90d", "required": false}, {"type": "double", "name":
+    "slope_amount", "required": false}, {"type": "double", "name": "slope_days_since_previous_transaction",
+    "required": false}, {"type": "double", "name": "slope_days_until_next_transaction",
+    "required": false}, {"type": "double", "name": "slope_customer_transaction_order",
+    "required": false}, {"type": "double", "name": "slope_days_since_first_transaction",
+    "required": false}, {"type": "double", "name": "min_amount", "required": false},
+    {"type": "double", "name": "mean_amount", "required": false}, {"type": "double",
+    "name": "mode_amount", "required": false}, {"type": "double", "name": "max_amount",
+    "required": false}, {"type": "double", "name": "q1_amount", "required": false},
+    {"type": "double", "name": "q5_amount", "required": false}, {"type": "double",
+    "name": "q10_amount", "required": false}, {"type": "double", "name": "q20_amount",
+    "required": false}, {"type": "double", "name": "q30_amount", "required": false},
+    {"type": "double", "name": "q40_amount", "required": false}, {"type": "double",
+    "name": "q50_amount", "required": false}, {"type": "double", "name": "q60_amount",
+    "required": false}, {"type": "double", "name": "q70_amount", "required": false},
+    {"type": "double", "name": "q80_amount", "required": false}, {"type": "double",
+    "name": "q90_amount", "required": false}, {"type": "double", "name": "q95_amount",
+    "required": false}, {"type": "double", "name": "q99_amount", "required": false},
+    {"type": "double", "name": "min_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "mean_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "mode_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "max_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q1_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q5_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q10_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q20_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q30_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q40_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q50_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q60_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q70_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q80_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q90_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q95_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "q99_days_since_previous_transaction", "required":
+    false}, {"type": "double", "name": "min_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "mean_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "mode_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "max_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q1_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q5_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q10_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q20_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q30_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q40_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q50_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q60_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q70_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q80_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q90_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q95_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "q99_days_until_next_transaction", "required":
+    false}, {"type": "double", "name": "min_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "mean_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "mode_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "max_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q1_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q5_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q10_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q20_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q30_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q40_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q50_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q60_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q70_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q80_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q90_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q95_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "q99_customer_transaction_order", "required":
+    false}, {"type": "double", "name": "min_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "mean_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "mode_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "max_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q1_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q5_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q10_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q20_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q30_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q40_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q50_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q60_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q70_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q80_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q90_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q95_days_since_first_transaction", "required":
+    false}, {"type": "double", "name": "q99_days_since_first_transaction", "required":
+    false}]'
+  outputs: '[{"type": "tensor", "tensor-spec": {"dtype": "float64", "shape": [-1]}}]'
+  params: null
+type_hint_from_example: false
+utc_time_created: '2026-01-21 10:36:03.162550'

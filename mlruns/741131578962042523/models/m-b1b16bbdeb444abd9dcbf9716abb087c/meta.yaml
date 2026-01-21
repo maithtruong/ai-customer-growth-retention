@@ -1,0 +1,10 @@
+artifact_location: file:///home/hong-mai/Desktop/HONGMAI/Coding/ai-customer-growth-retention/mlruns/741131578962042523/models/m-b1b16bbdeb444abd9dcbf9716abb087c/artifacts
+creation_timestamp: 1768991887111
+experiment_id: '741131578962042523'
+last_updated_timestamp: 1768991889305
+model_id: m-b1b16bbdeb444abd9dcbf9716abb087c
+model_type: null
+name: 31_12_2025_is_churn_60_days
+source_run_id: 01d85265c7dd44c0b0346b19a85a3069
+status: 2
+status_message: null

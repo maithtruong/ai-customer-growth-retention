@@ -83,6 +83,9 @@ import tempfile
 # %%
 import lightgbm as lgb
 
+# %%
+from sklearn.model_selection import train_test_split
+
 # %% [markdown]
 # ## Environment
 
@@ -107,10 +110,13 @@ PROJECT_ROOT = Path.cwd().parent
 BASE_GOLD_DIR = PROJECT_ROOT / "data" / "gold" / OBSERVED_DATE_STR
 
 # %%
+BGF_DATA_PATH = BASE_GOLD_DIR / "cut_30d" / "features" / "bgnbd"
+
+# %%
 MLRUNS_DIR = PROJECT_ROOT / "mlruns"
 
 # %%
-EXPERIMENT_NAME = "bg-nbd"
+EXPERIMENT_NAME = "customer_activity_modeling"
 
 # %%
 mlflow.set_tracking_uri(f"file://{MLRUNS_DIR}")
@@ -1422,10 +1428,10 @@ def load_production_models():
 
 
 # %%
-def load_prod_bg_nbd():
-    exp = mlflow.get_experiment_by_name("bg-nbd")
+def load_bg_nbd_model(exp_name="customer_activity_modeling"):
+    exp = mlflow.get_experiment_by_name(exp_name)
     if exp is None:
-        raise ValueError("Experiment 'bg-nbd' not found")
+        raise ValueError(f"Experiment {exp_name} not found")
 
     runs = mlflow.search_runs(
         experiment_ids=[exp.experiment_id],
@@ -1449,12 +1455,14 @@ def load_prod_bg_nbd():
     }
 
     with tempfile.TemporaryDirectory() as d:
-        path = mlflow.artifacts.download_artifacts(
+        local_path = mlflow.artifacts.download_artifacts(
             run_id=run_id,
-            artifact_path="bg_nbd_model/bg_nbd.pkl",
+            artifact_path="model/model.pkl",
             dst_path=d,
         )
-        model = cloudpickle.load(open(path, "rb"))
+
+        with open(local_path, "rb") as f:
+            model = cloudpickle.load(f)
 
     return model, metadata
 
@@ -1965,13 +1973,18 @@ def get_truth_number_of_purchases(
 # ### Train
 
 # %%
-def log_bg_nbd_model(bgf):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = Path(tmpdir) / "bg_nbd.pkl"
-        with open(path, "wb") as f:
-            cloudpickle.dump(bgf, f)
+def log_lifetimes_model(model, filename: str = "model.pkl"):
+    tmp_path = Path(filename)
 
-        mlflow.log_artifact(path, artifact_path="bg_nbd_model")
+    with open(tmp_path, "wb") as f:
+        cloudpickle.dump(model, f)
+
+    mlflow.log_artifact(
+        local_path=str(tmp_path),
+        artifact_path="model"
+    )
+
+    tmp_path.unlink()  # cleanup
 
 
 # %%
@@ -1983,19 +1996,18 @@ def train_bg_nbd(
     X_test: pd.DataFrame | None = None,
     y_test: pd.DataFrame | None = None,
     target_2: str = "n_purchase_30d",
-    horizon_days=30,
+    horizon_days: int = 30,
     threshold: float = 0.5,
 ):
     """
     Trains a BG-NBD model and evaluates churn when labels are available.
 
-    Assumptions:
-    - X_* index = customer_id
-    - X_* contain ['frequency', 'recency', 'T']
-    - y_* contain ['is_churn'] and share index with X_*
+    Guarantees:
+    - NEVER mutates input DataFrames
+    - All predictions are written to safe copies
     """
 
-    pred_2 = f'pred_{target_2}'
+    pred_2 = f"pred_{target_2}"
 
     # ======================
     # Train BG-NBD
@@ -2008,32 +2020,39 @@ def train_bg_nbd(
     )
 
     # ======================
-    # Add predictions (IN PLACE)
+    # Prediction helper (SAFE)
     # ======================
-    X_train = predict_p_alive_churn_bg_nbd(X_train, bgf)
-    X_train = predict_n_purchase_bg_nbd(X_train, bgf, t=horizon_days)
+    def add_predictions(X: pd.DataFrame | None):
+        if X is None:
+            return None
 
-    if X_val is not None:
-        X_val = predict_p_alive_churn_bg_nbd(X_val, bgf)
-        X_val = predict_n_purchase_bg_nbd(X_val, bgf, t=horizon_days)
+        X_pred = X.copy()
 
-    if X_test is not None:
-        X_test = predict_p_alive_churn_bg_nbd(X_test, bgf)
-        X_test = predict_n_purchase_bg_nbd(X_test, bgf, t=horizon_days)
+        X_pred = predict_p_alive_churn_bg_nbd(X_pred, bgf)
+        X_pred = predict_n_purchase_bg_nbd(
+            X_pred, bgf, t=horizon_days
+        )
+
+        return X_pred
+
+    X_train_pred = add_predictions(X_train)
+    X_val_pred = add_predictions(X_val)
+    X_test_pred = add_predictions(X_test)
 
     # ======================
-    # Evaluation helper (inline, no copies)
+    # Evaluation helper
     # ======================
-    def evaluate(X, y, split_name):
-        eval_df = X.join(y, how="inner")
+    def evaluate(X_pred, y, split_name):
+        if X_pred is None or y is None:
+            return None
 
-        eval_df.loc[:, "pred_churn"] = (
+        eval_df = X_pred.join(y, how="inner")
+
+        eval_df["pred_churn"] = (
             eval_df["p_churn"] >= threshold
         ).astype(int)
 
-        mae = (
-            eval_df[target_2] - eval_df[pred_2]
-        ).abs().mean()
+        mae = (eval_df[target_2] - eval_df[pred_2]).abs().mean()
 
         metrics = {
             "roc_auc": roc_auc_score(
@@ -2043,10 +2062,10 @@ def train_bg_nbd(
                 eval_df["is_churn"], eval_df["p_churn"]
             ),
             "precision": precision_score(
-                eval_df["is_churn"], eval_df["pred_churn"]
+                eval_df["is_churn"], eval_df["pred_churn"], zero_division=0
             ),
             "recall": recall_score(
-                eval_df["is_churn"], eval_df["pred_churn"]
+                eval_df["is_churn"], eval_df["pred_churn"], zero_division=0
             ),
             "mae": mae,
         }
@@ -2062,7 +2081,6 @@ def train_bg_nbd(
             columns=["pred_no_churn", "pred_churn"],
         )
 
-        # MLflow logging
         for k, v in metrics.items():
             mlflow.log_metric(f"{split_name}_{k}", v)
 
@@ -2073,33 +2091,32 @@ def train_bg_nbd(
 
         return metrics, cm_df
 
+    # ======================
+    # Collect results
+    # ======================
     results = {
         "model": bgf,
-        "train": X_train,
+        "train": evaluate(X_train_pred, y_train, "train"),
     }
 
-    # ======================
-    # Validation evaluation
-    # ======================
-    if X_val is not None and y_val is not None:
-        results["val"] = evaluate(X_val, y_val, "val")
+    if X_val_pred is not None and y_val is not None:
+        results["val"] = evaluate(X_val_pred, y_val, "val")
+
+    if X_test_pred is not None and y_test is not None:
+        results["test"] = evaluate(X_test_pred, y_test, "test")
 
     # ======================
-    # Test evaluation
-    # ======================
-    if X_test is not None and y_test is not None:
-        results["test"] = evaluate(X_test, y_test, "test")
-
-    # ======================
-    # MLflow model logging (correct for BG-NBD)
+    # MLflow logging
     # ======================
     mlflow.log_param("model_type", "BG-NBD")
     mlflow.log_param("target_1", "p_churn")
     mlflow.log_param("target_2", target_2)
+    mlflow.log_param("horizon_days", horizon_days)
     mlflow.log_param("threshold", threshold)
 
-    mlflow.log_param("model_type", "BG-NBD")
-    log_bg_nbd_model(bgf)
+    log_lifetimes_model(bgf)
+
+    mlflow.set_tag("run_status", "success")
 
     return results
 
@@ -2193,6 +2210,44 @@ def predict_users_bg_nbd(
         },
         index=X.index,
     )
+
+
+# %%
+def load_bg_nbd_model(exp_name="customer_activity_modeling"):
+    exp = mlflow.get_experiment_by_name(exp_name)
+    if exp is None:
+        raise ValueError(f"Experiment {exp_name} not found")
+
+    runs = mlflow.search_runs(
+        experiment_ids=[exp.experiment_id],
+        filter_string="tags.stage = 'production'",
+        output_format="pandas",
+    )
+
+    if runs.empty:
+        raise ValueError("No production BG-NBD run found")
+
+    run = runs.iloc[0]
+    run_id = run["run_id"]
+
+    metadata = {
+        "run_id": run_id,
+        "experiment_id": exp.experiment_id,
+        "experiment_name": exp.name,
+        "params": run.filter(like="params.").to_dict(),
+        "metrics": run.filter(like="metrics.").to_dict(),
+        "tags": run.filter(like="tags.").to_dict(),
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+        path = mlflow.artifacts.download_artifacts(
+            run_id=run_id,
+            artifact_path="model",
+            dst_path=d,
+        )
+        model = cloudpickle.load(open(path, "rb"))
+
+    return model, metadata
 
 
 # %% [markdown]
@@ -2859,54 +2914,102 @@ for split in split_cut_dfs.keys():
 # ## Read Data
 
 # %%
+input_path = (
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "bgnbd"
+    / "raw"
+    / "features.csv"
+)
+
+bgf_features = pd.read_csv(input_path, index_col="customer_id")
+
+# %%
+input_path = (
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "bgnbd"
+    / "target"
+    / "target.csv"
+)
+
+bgf_targets = pd.read_csv(input_path, index_col="customer_id")
+
+# %%
+bgf_df = bgf_features.join(bgf_targets)
+
+# %%
+(
+    X_train,
+    X_val,
+    X_test,
+    y_train,
+    y_val,
+    y_test
+) = split_train_test_val(
+    customers_modeling_df=bgf_df.reset_index(),
+    targets=['is_churn', 'n_purchase_30d'],
+    test_size=0.33,
+    val_size=0.33,
+    random_state=42,
+)
+
+# %%
 inf_split_dfs = {
-    'train':[],
-    'test':[],
-    'val':[]
+    'train': [X_train, y_train],
+    'test': [X_test, y_test],
+    'val': [X_val, y_val]
 }
-
-# %%
-for split in inf_split_dfs.keys():
-    X = pd.read_csv(BASE_GOLD_DIR / "clv" / f"X_{split}_cut.csv", index_col=0)
-    y = pd.read_csv(BASE_GOLD_DIR / "clv" / f"y_{split}_cut.csv", index_col=0)
-    inf_split_dfs[split] = [X, y]
-
-# %%
-inf_split_dfs['val'][0]
 
 # %% [markdown]
 # ## Log Model
 
 # %%
-with mlflow.start_run(
-    run_name=f"{BASE_GOLD_DIR}_cut_30d"
-):
-    mlflow.log_param("gold_data_version", BASE_GOLD_DIR.name)
+target_2 = "n_purchase_30d"
 
-    train_bg_nbd(
-        X_train=inf_split_dfs['train'][0],
-        y_train=inf_split_dfs['train'][1],
-        X_val=inf_split_dfs['val'][0],
-        y_val=inf_split_dfs['val'][1],
-        X_test=inf_split_dfs['test'][0],
-        y_test=inf_split_dfs['test'][1],
-        target_2="n_purchase_30d",
-        horizon_days=30,
-        threshold=0.5,
-    )
+thresholds = [0, 0.3, 0.4, 0.5, 0.6, 0.7]
+
+for thres in thresholds:
+    run_name = f"bgf_{target_2}_th{thres}"
+
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_param("dataset_version", OBSERVED_DATE_STR)
+        mlflow.log_param("dataset_type", "raw")
+        mlflow.log_param("dataset_cut", "cut_30d")
+
+        mlflow.log_param("threshold", thres)
+
+        train_bg_nbd(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            X_test=X_test,
+            y_test=y_test,
+            target_2=target_2,
+            horizon_days=30,
+            threshold=thres,
+        )
+
+# %% [markdown]
+# Model with 0 penalizer have the best val recall.
+#
+# ![image.png](attachment:image.png)
 
 # %% [markdown]
 # ## Upgrade model to production
 
 # %%
-promote_to_production("229b3946b31b48659ad3df3e8e32ab64")
+promote_to_production("f4ca3f1e83854221a558d35d2fa7d4e4")
 
 # %%
-model, metadata = load_prod_bg_nbd()
+model, metadata = load_bg_nbd_model()
 
 # %%
 # Have to also load up the summary dataframe accompanying the model
-summary_cut_30d_df = pd.read_csv(BASE_GOLD_DIR / "clv" / "summary_cut_30d_df.csv")
+summary_cut_30d_df = pd.read_csv(BGF_DATA_PATH / "raw" / "features.csv")
 
 # %% [markdown]
 # ## Inference

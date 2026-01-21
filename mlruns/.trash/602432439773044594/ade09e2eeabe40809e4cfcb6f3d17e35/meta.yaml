@@ -1,0 +1,15 @@
+artifact_uri: file:///home/hong-mai/Desktop/HONGMAI/Coding/ai-customer-growth-retention/mlruns/602432439773044594/ade09e2eeabe40809e4cfcb6f3d17e35/artifacts
+deleted_time: 1768989263195
+end_time: 1768989222840
+entry_point_name: ''
+experiment_id: '602432439773044594'
+lifecycle_stage: deleted
+run_id: ade09e2eeabe40809e4cfcb6f3d17e35
+run_name: lgbm_is_churn_30_days_raw
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1768989219409
+status: 3
+tags: []
+user_id: hong-mai

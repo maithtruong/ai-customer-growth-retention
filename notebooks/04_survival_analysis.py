@@ -2520,7 +2520,11 @@ joblib.dump(
 # %% [markdown]
 # The previous steps are ignorable. I have composed it into a pipeline to get the necessary features.
 
+# %% [markdown]
+# ### Get Features
+
 # %%
+'''
 raw_survival_df, label_df = get_survival_clv_features_df(
     seed_customers_path=f"../{SEED_CUSTOMERS}",
     seed_transactions_path=f"../{SEED_TRANSACTIONS}",
@@ -2529,8 +2533,10 @@ raw_survival_df, label_df = get_survival_clv_features_df(
     churn_windows=[30],
 )
 survival_features_labels = raw_survival_df.join(label_df)
+'''
 
 # %%
+'''
 output_path = (
     BASE_GOLD_DIR
     / "cut_30d"
@@ -2548,18 +2554,7 @@ survival_features_labels.to_csv(
     output_path
     ,index=True
 )
-
-# %%
-survival_features_labels = pd.read_csv(
-    BASE_GOLD_DIR
-    / "cut_30d"
-    / "features"
-    / "clv"
-    / "survival_gg"
-    / "raw"
-    / "features.csv"
-#    , index_col = 0
-)
+'''
 
 # %%
 (
@@ -2598,6 +2593,60 @@ output_path.parent.mkdir(parents=True, exist_ok=True)
 
 with open(output_path, "wb") as f:
     cloudpickle.dump(survival_pipeline, f)
+
+# %% [markdown]
+# ### Read Features
+
+# %%
+survival_features_raw = pd.read_csv(
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "raw"
+    / "features.csv"
+#    , index_col = 0
+)
+
+# %%
+survival_features_transformed = pd.read_csv(
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "transformed"
+    / "features.csv"
+    , index_col = "customer_id"
+)
+
+# %%
+(
+    X_train_survival_raw,
+    X_val_survival_raw,
+    X_test_survival_raw,
+    y_train,
+    y_val,
+    y_test
+) = split_train_test_val(
+    customers_modeling_df=survival_features_raw,
+    targets=['is_churn_30_days'],
+    test_size=0.33,
+    val_size=0.33,
+    random_state=42,
+)
+
+# %%
+X_train_survival_transformed = survival_features_transformed.loc[
+    X_train_survival_raw.index
+]
+X_test_survival_transformed = survival_features_transformed.loc[
+    X_test_survival_raw.index
+]
+X_val_survival_transformed = survival_features_transformed.loc[
+    X_val_survival_raw.index
+]
 
 # %% [markdown]
 # # Test Models
@@ -2803,7 +2852,8 @@ for penalizer, l1_ratio in product(
 
     with mlflow.start_run(run_name=run_name):
 
-        mlflow.log_param("dataset_version", f"{MAX_DATA_DATE_STR}__cut_30d")
+        mlflow.log_param("dataset_version", f"{MAX_DATA_DATE_STR}")
+        mlflow.log_param("dataset_cut", f"cut_30d")
 
         train_cox(
             X_train=split_dfs["train"][0],
@@ -2836,7 +2886,8 @@ for penalizer, l1_ratio in product(
 
     with mlflow.start_run(run_name=run_name):
 
-        mlflow.log_param("dataset_version", f"{MAX_DATA_DATE_STR}__cut_30d")
+        mlflow.log_param("dataset_version", f"{MAX_DATA_DATE_STR}")
+        mlflow.log_param("dataset_cut", f"cut_30d")
 
         train_weibull(
             X_train=split_dfs["train"][0],
@@ -2867,7 +2918,7 @@ for penalizer, l1_ratio in product(
 # I will promote Weibull to production because its performance technically slightly better than other models.
 
 # %%
-promote_to_production("7bf52a14feb9409882741249fc0046de")
+promote_to_production("79c5438e7710487e886c8cd70368ecff")
 
 # %%
 model, metadata = load_survival_analysis_model()

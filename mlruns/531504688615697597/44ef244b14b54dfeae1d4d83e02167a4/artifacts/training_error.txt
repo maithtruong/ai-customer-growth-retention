@@ -1,0 +1,34 @@
+Traceback (most recent call last):
+  File "/tmp/ipykernel_25932/3965374797.py", line 26, in train_weibull
+    model.fit(
+  File "/home/hong-mai/venvs/maipy/lib/python3.12/site-packages/lifelines/utils/__init__.py", line 56, in f
+    return function(model, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hong-mai/venvs/maipy/lib/python3.12/site-packages/lifelines/fitters/__init__.py", line 2872, in fit
+    super(ParametericAFTRegressionFitter, self)._fit(
+  File "/home/hong-mai/venvs/maipy/lib/python3.12/site-packages/lifelines/fitters/__init__.py", line 1837, in _fit
+    _params, self.log_likelihood_, self._hessian_ = self._fit_model(
+                                                    ^^^^^^^^^^^^^^^^
+  File "/home/hong-mai/venvs/maipy/lib/python3.12/site-packages/lifelines/fitters/__init__.py", line 1976, in _fit_model
+    raise exceptions.ConvergenceError(
+lifelines.exceptions.ConvergenceError: 
+               Fitting did not converge. Try the following:
+
+               0. Are there any lifelines warnings outputted during the `fit`?
+               1. Inspect your DataFrame: does everything look as expected?
+               2. Try scaling your duration vector down, i.e. `df[duration_col] = df[duration_col]/100`
+               3. Is there high-collinearity in the dataset? Try using the variance inflation factor (VIF) to find redundant variables.
+               4. Try using an alternate minimizer: ``fitter._scipy_fit_method = "SLSQP"``.
+               5. Trying adding a small penalizer (or changing it, if already present). Example: `WeibullAFTFitter(penalizer=0.01).fit(...)`.
+               6. Are there any extreme outliers? Try modeling them or dropping them to see if it helps convergence.
+
+               minimum_results= message: Iteration limit reached
+success: False
+ status: 9
+    fun: 3.315146371478904
+      x: [-1.246e-06  1.535e-04 ...  4.830e+00  1.055e+00]
+    nit: 200
+    jac: [-2.418e-03 -1.282e-04 ... -1.024e-05 -5.739e-05]
+   nfev: 494
+   njev: 200
+

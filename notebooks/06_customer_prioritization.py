@@ -127,9 +127,19 @@ def get_customer_features(
 # ### Load Models
 
 # %%
+def load_models_once():
+    if MODEL_STORE:
+        return  # already loaded
+
+    MODEL_STORE["ggf"], MODEL_STORE["ggf_meta"] = load_gamma_gamma_model()
+    MODEL_STORE["bgf"], MODEL_STORE["bgf_meta"] = load_bg_nbd_model()
+    MODEL_STORE["survival"], MODEL_STORE["survival_meta"] = load_survival_analysis_model()
+
+
+# %%
 def load_churn_classifiers():
 
-    exp = mlflow.get_experiment_by_name("churn-lightgbm")
+    exp = mlflow.get_experiment_by_name("churn_prediction")
     if exp is None:
         raise ValueError(f"Experiment {exp} not found")
     
@@ -163,10 +173,10 @@ def load_churn_classifiers():
 
 
 # %%
-def load_bg_nbd_model():
-    exp = mlflow.get_experiment_by_name("bg-nbd")
+def load_bg_nbd_model(exp_name="customer_activity_modeling"):
+    exp = mlflow.get_experiment_by_name(exp_name)
     if exp is None:
-        raise ValueError("Experiment 'bg-nbd' not found")
+        raise ValueError(f"Experiment {exp_name} not found")
 
     runs = mlflow.search_runs(
         experiment_ids=[exp.experiment_id],
@@ -190,12 +200,14 @@ def load_bg_nbd_model():
     }
 
     with tempfile.TemporaryDirectory() as d:
-        path = mlflow.artifacts.download_artifacts(
+        local_path = mlflow.artifacts.download_artifacts(
             run_id=run_id,
-            artifact_path="bg_nbd_model/bg_nbd.pkl",
+            artifact_path="model/model.pkl",
             dst_path=d,
         )
-        model = cloudpickle.load(open(path, "rb"))
+
+        with open(local_path, "rb") as f:
+            model = cloudpickle.load(f)
 
     return model, metadata
 
