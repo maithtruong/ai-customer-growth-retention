@@ -35,6 +35,7 @@ import numpy as np
 from dotenv import load_dotenv
 import os
 from pathlib import Path
+import joblib
 
 # %%
 from scipy import stats
@@ -68,6 +69,24 @@ from sklearn.metrics import (
     classification_report
 )
 
+# %%
+from sklearn.base import BaseEstimator, TransformerMixin
+
+# %%
+from itertools import product
+
+# %%
+import mlflow
+
+# %%
+import cloudpickle
+
+# %%
+import traceback
+
+# %%
+import tempfile
+
 # %% [markdown]
 # ## Environment
 
@@ -94,6 +113,14 @@ SEED_TRANSACTIONS=os.getenv("SEED_TRANSACTIONS")
 
 # %%
 targets = ['is_churn_30_days']
+
+# %%
+MLRUNS_DIR = PROJECT_ROOT / "mlruns"
+EXPERIMENT_NAME = "customer_lifetime_modeling"
+mlflow.set_tracking_uri(f"file://{MLRUNS_DIR}")
+from mlflow.tracking import MlflowClient
+
+client = MlflowClient()
 
 
 # %% [markdown]
@@ -1560,6 +1587,84 @@ def load_features(
 # ### Feature Engineering
 
 # %%
+def get_survival_clv_features_df(
+    seed_customers_path: str,
+    seed_transactions_path: str,
+    cutoff_date,
+    max_data_date,
+    churn_windows=[30],
+):
+    """
+    Build survival analysis dataset from customer & transaction CSV paths.
+
+    Returns
+    -------
+    survival_df : pd.DataFrame
+        Feature matrix indexed by customer_id, including duration & event columns
+    label_df : pd.DataFrame
+        Churn labels indexed by customer_id
+    """
+
+    # --- Load raw data ---
+    customers_df = pd.read_csv(seed_customers_path)
+    transactions_df = pd.read_csv(seed_transactions_path)
+
+    # --- Build modeling base ---
+    transactions_modeling_df, customers_modeling_df = build_training_base(
+        seed_customers_path=seed_customers_path,
+        seed_transactions_path=seed_transactions_path,
+        train_snapshot_date=cutoff_date,
+        churn_windows=list(churn_windows),
+    )
+
+    # --- Feature engineering ---
+    raw_features_df = build_customer_features(
+        transactions_modeling_df,
+        customers_modeling_df,
+        observed_date=cutoff_date,
+    )
+
+    rfm_features_df = get_customers_screenshot_summary_from_transactions_df(
+        transactions_df=transactions_modeling_df,
+        observed_date=cutoff_date,
+        column_names=["customer_id", "transaction_date", "amount"],
+    )
+
+    # --- Add survival targets (T, E) ---
+    survival_df = add_duration_event(
+        customers_df=raw_features_df,
+        obs_end_date=max_data_date,
+        start_col="signup_date",
+        termination_col="termination_date",
+    )
+    # --- Merge datasets ---
+    survival_df = survival_df.merge(
+        rfm_features_df,
+        on="customer_id",
+        how="inner"
+    )
+
+    # --- Extract labels ---
+    label_cols = [f"is_churn_{w}_days" for w in churn_windows]
+    label_df = survival_df[["customer_id", *label_cols]].set_index("customer_id")
+
+    # --- Drop target / leakage columns ---
+    survival_df = survival_df.drop(
+        columns=[
+            "signup_date",
+            "termination_date",
+            "true_lifetime_days",
+            "period_first_transaction_date",
+            "period_last_transaction_date",
+            "days_until_observed",
+            *label_cols,
+        ]
+    ).set_index("customer_id")
+
+    return survival_df, label_df
+
+
+# %%
 def add_duration_event(
     customers_df: pd.DataFrame,
     obs_end_date: pd.Timestamp,
@@ -1617,6 +1722,150 @@ def survival_to_churn_proba(
         probs.append(1 - s_h)
 
     return pd.Series(probs, index=X.index, name="p_churn")
+
+
+# %%
+def build_survival_dataset(
+    seed_customers_path: str,
+    seed_transactions_path: str,
+    cutoff_date,
+    max_data_date,
+    churn_windows=[30],
+):
+    """
+    Build survival analysis dataset from customer & transaction CSV paths.
+
+    Returns
+    -------
+    survival_df : pd.DataFrame
+        Feature matrix indexed by customer_id, including duration & event columns
+    label_df : pd.DataFrame
+        Churn labels indexed by customer_id
+    """
+
+    # --- Load raw data ---
+    customers_df = pd.read_csv(seed_customers_path)
+    transactions_df = pd.read_csv(seed_transactions_path)
+
+    # --- Build modeling base ---
+    transactions_modeling_df, customers_modeling_df = build_training_base(
+        seed_customers_path=seed_customers_path,
+        seed_transactions_path=seed_transactions_path,
+        train_snapshot_date=cutoff_date,
+        churn_windows=list(churn_windows),
+    )
+
+    # --- Feature engineering ---
+    raw_features_df = build_customer_features(
+        transactions_modeling_df,
+        customers_modeling_df,
+        observed_date=cutoff_date,
+    )
+
+    # --- Add survival targets (T, E) ---
+    survival_df = add_duration_event(
+        customers_df=raw_features_df,
+        obs_end_date=max_data_date,
+        start_col="signup_date",
+        termination_col="termination_date",
+    )
+
+    # --- Extract labels ---
+    label_cols = [f"is_churn_{w}_days" for w in churn_windows]
+    label_df = survival_df[["customer_id", *label_cols]].set_index("customer_id")
+
+    # --- Drop target / leakage columns ---
+    survival_df = survival_df.drop(
+        columns=[
+            "signup_date",
+            "termination_date",
+            "true_lifetime_days",
+            *label_cols,
+        ]
+    ).set_index("customer_id")
+
+    return survival_df, label_df
+
+
+# %%
+class SurvivalFeaturePipeline(BaseEstimator, TransformerMixin):
+    """
+    Feature transformation pipeline for survival analysis.
+
+    Steps:
+    1. Select feature columns (exclude T, E)
+    2. Median imputation
+    3. Drop features highly correlated with T
+    4. Drop near-zero variance features
+    5. Standard scaling
+    """
+
+    def __init__(
+        self,
+        corr_threshold: float = 0.95,
+        std_threshold: float = 1e-6,
+    ):
+        self.corr_threshold = corr_threshold
+        self.std_threshold = std_threshold
+
+        self.imputer = SimpleImputer(strategy="median")
+        self.scaler = StandardScaler()
+
+        # learned attributes
+        self.feature_cols_ = None
+        self.keep_cols_ = None
+
+    def fit(self, raw_survival_df: pd.DataFrame, y=None):
+        df = raw_survival_df.copy()
+
+        # --- identify feature columns ---
+        self.feature_cols_ = [
+            c for c in df.columns
+            if c not in {
+                "customer_id",
+                "T",
+                "E",
+                "period_transaction_count",
+                "period_total_amount",
+            }
+        ]
+
+        # --- imputation (fit only) ---
+        X = self.imputer.fit_transform(df[self.feature_cols_])
+        X = pd.DataFrame(X, columns=self.feature_cols_, index=df.index)
+
+        # --- correlation with T ---
+        corr_with_T = X.corrwith(df["T"]).abs()
+        keep = corr_with_T[corr_with_T < self.corr_threshold].index
+
+        # --- variance filter ---
+        std = X[keep].std()
+        self.keep_cols_ = std[std > self.std_threshold].index.tolist()
+
+        # --- fit scaler ---
+        self.scaler.fit(X[self.keep_cols_])
+
+        return self
+
+    def transform(self, raw_survival_df: pd.DataFrame):
+        df = raw_survival_df.copy()
+
+        X = pd.DataFrame(
+            self.imputer.transform(df[self.feature_cols_]),
+            columns=self.feature_cols_,
+            index=df.index,
+        )
+
+        X = self.scaler.transform(X[self.keep_cols_])
+        X = pd.DataFrame(X, columns=self.keep_cols_, index=df.index)
+
+        return pd.concat(
+            [
+                X,
+                df[["T", "E", "period_transaction_count", "period_total_amount"]],
+            ],
+            axis=1,
+        )
 
 
 # %% [markdown]
@@ -1707,6 +1956,263 @@ def evaluate_churn_predictions(
 # ### Inference
 
 # %%
+def train_cox(
+    X_train: pd.DataFrame,
+    y_train: pd.DataFrame | None = None,
+    X_val: pd.DataFrame | None = None,
+    y_val: pd.DataFrame | None = None,
+    X_test: pd.DataFrame | None = None,
+    y_test: pd.DataFrame | None = None,
+    target: str = "is_churn_30_days",
+    horizon_days: int = 30,
+    threshold: float = 0.5,
+    model_params: dict | None = None,
+):
+    """
+    Trains a Cox model and evaluates churn when labels are available.
+    Prediction outputs NEVER mutate input dataframes.
+    """
+
+    model_params = model_params or {}
+    mlflow.log_param("model_type", "cox")
+
+    try:
+        # ======================
+        # Train Cox
+        # ======================
+        cph = CoxPHFitter(**model_params)
+
+        cph.fit(
+            X_train,
+            duration_col="T",
+            event_col="E",
+        )
+
+        proba_col = f"p_churn_{horizon_days}_days"
+
+        # ======================
+        # Prediction (SAFE COPIES)
+        # ======================
+        def add_predictions(X):
+            if X is None:
+                return None
+
+            X_pred = X.copy()
+
+            X_pred[proba_col] = survival_to_churn_proba(
+                model=cph,
+                X=X,
+                horizon_days=horizon_days,
+            )
+            return X_pred
+
+        X_train_pred = add_predictions(X_train)
+        X_val_pred = add_predictions(X_val)
+        X_test_pred = add_predictions(X_test)
+
+        # ======================
+        # Evaluation helper
+        # ======================
+        def evaluate(X, y, split_name):
+            if X is None or y is None:
+                return None
+
+            metrics, cm_df, eval_df = evaluate_churn_predictions(
+                feature_df=X,
+                target_df=y,
+                threshold=threshold,
+                target_col=target,
+                proba_col=proba_col,
+            )
+
+            for k, v in metrics.items():
+                mlflow.log_metric(f"{split_name}_{k}", v)
+
+            mlflow.log_text(
+                cm_df.to_string(),
+                artifact_file=f"confusion_matrix/{split_name}_churn.txt",
+            )
+
+            return metrics, cm_df
+
+        results = {
+            "model": cph,
+            "train": evaluate(X_train_pred, y_train, "train"),
+        }
+
+        if X_val_pred is not None and y_val is not None:
+            results["val"] = evaluate(X_val_pred, y_val, "val")
+
+        if X_test_pred is not None and y_test is not None:
+            results["test"] = evaluate(X_test_pred, y_test, "test")
+
+        # ======================
+        # MLflow logging
+        # ======================
+        mlflow.log_param("target", target)
+        mlflow.log_param("horizon_days", horizon_days)
+        mlflow.log_param("threshold", threshold)
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        log_lifetimes_model(cph)
+
+        mlflow.set_tag("run_status", "success")
+
+        return results
+
+    except Exception:
+        error_msg = traceback.format_exc()
+
+        mlflow.set_tag("run_status", "failed")
+        mlflow.log_text(error_msg, artifact_file="training_error.txt")
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        print(f"[WARN] Cox training failed with params={model_params}")
+        print(error_msg)
+
+        return None
+
+
+# %%
+def train_weibull(
+    X_train: pd.DataFrame,
+    y_train: pd.DataFrame | None = None,
+    X_val: pd.DataFrame | None = None,
+    y_val: pd.DataFrame | None = None,
+    X_test: pd.DataFrame | None = None,
+    y_test: pd.DataFrame | None = None,
+    target: str = "is_churn_30_days",
+    horizon_days: int = 30,
+    threshold: float = 0.5,
+    model_params: dict | None = None,
+):
+    """
+    Trains a Weibull AFT model.
+    NEVER mutates input dataframes.
+    """
+
+    model_params = model_params or {}
+    mlflow.log_param("model_type", "weibull")
+
+    try:
+        # ======================
+        # Train Weibull
+        # ======================
+        model = WeibullAFTFitter(**model_params)
+        model.fit(
+            X_train,
+            duration_col="T",
+            event_col="E",
+        )
+
+        proba_col = f"p_churn_{horizon_days}_days"
+
+        # ======================
+        # Prediction helper (SAFE COPIES)
+        # ======================
+        def add_predictions(X):
+            if X is None:
+                return None
+
+            X_pred = X.copy()
+            X_pred[proba_col] = survival_to_churn_proba(
+                model=model,
+                X=X,
+                horizon_days=horizon_days,
+            )
+            return X_pred
+
+        X_train_pred = add_predictions(X_train)
+        X_val_pred = add_predictions(X_val)
+        X_test_pred = add_predictions(X_test)
+
+        # ======================
+        # Evaluation helper
+        # ======================
+        def evaluate(X, y, split_name):
+            if X is None or y is None:
+                return None
+
+            metrics, cm_df, eval_df = evaluate_churn_predictions(
+                feature_df=X,
+                target_df=y,
+                threshold=threshold,
+                target_col=target,
+                proba_col=proba_col,
+            )
+
+            for k, v in metrics.items():
+                mlflow.log_metric(f"{split_name}_{k}", v)
+
+            mlflow.log_text(
+                cm_df.to_string(),
+                artifact_file=f"confusion_matrix/{split_name}_churn.txt",
+            )
+
+            return metrics, cm_df
+
+        results = {
+            "model": model,
+            "train": evaluate(X_train_pred, y_train, "train"),
+        }
+
+        if X_val_pred is not None and y_val is not None:
+            results["val"] = evaluate(X_val_pred, y_val, "val")
+
+        if X_test_pred is not None and y_test is not None:
+            results["test"] = evaluate(X_test_pred, y_test, "test")
+
+        # ======================
+        # MLflow logging
+        # ======================
+        mlflow.log_param("target", target)
+        mlflow.log_param("horizon_days", horizon_days)
+        mlflow.log_param("threshold", threshold)
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        log_lifetimes_model(model)
+
+        mlflow.set_tag("run_status", "success")
+
+        return results
+
+    except Exception:
+        error_msg = traceback.format_exc()
+
+        mlflow.set_tag("run_status", "failed")
+        mlflow.log_text(error_msg, artifact_file="training_error.txt")
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        print("[WARN] Weibull training failed")
+        print(error_msg)
+
+        return None
+
+
+# %%
+def log_lifetimes_model(model, filename: str = "model.pkl"):
+    tmp_path = Path(filename)
+
+    with open(tmp_path, "wb") as f:
+        cloudpickle.dump(model, f)
+
+    mlflow.log_artifact(
+        local_path=str(tmp_path),
+        artifact_path="model"
+    )
+
+    tmp_path.unlink()  # cleanup
+
+
+# %%
 def predict_user_survival(
     customer_id: str,
     survival_df: pd.DataFrame,
@@ -1723,7 +2229,7 @@ def predict_user_survival(
     if row.empty:
         raise ValueError(f"Customer {customer_id} not found")
 
-    X = row.drop(columns=["customer_id", "T", "E"], errors="ignore")
+    X = row.drop(columns=["customer_id", "T", "E"], errors="ignore").to_frame().T
 
     # Survival function (continuous)
     surv_fn = model.predict_survival_function(X)
@@ -1751,6 +2257,45 @@ def predict_user_survival(
     }
 
 
+# %%
+def load_survival_analysis_model():
+    exp = mlflow.get_experiment_by_name("customer_lifetime_modeling")
+    if exp is None:
+        raise ValueError(f"Experiment {exp} not found")
+
+    runs = mlflow.search_runs(
+        experiment_ids=[exp.experiment_id],
+        filter_string="tags.stage = 'production'",
+        output_format="pandas",
+    )
+
+    if runs.empty:
+        raise ValueError("No production run found")
+
+    run = runs.iloc[0]
+    run_id = run["run_id"]
+
+    metadata = {
+        "run_id": run_id,
+        "experiment_id": exp.experiment_id,
+        "experiment_name": exp.name,
+        "params": run.filter(like="params.").to_dict(),
+        "metrics": run.filter(like="metrics.").to_dict(),
+        "tags": run.filter(like="tags.").to_dict(),
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+
+        path = mlflow.artifacts.download_artifacts(
+            run_id=run_id,
+            artifact_path="model/model.pkl",
+            dst_path=d,
+        )
+        model = cloudpickle.load(open(path, "rb"))
+
+    return model, metadata
+
+
 # %% [markdown]
 # # Data
 
@@ -1760,22 +2305,27 @@ def predict_user_survival(
 # %% [markdown]
 # ### Create Features
 
-# %% [markdown]
-# customers_df = pd.read_csv(f"../{SEED_CUSTOMERS}")
-# transactions_df = pd.read_csv(f"../{SEED_TRANSACTIONS}")
-#
-# transactions_df = transform_transactions_df(transactions_df)
-# customers_df = transform_customers_df(customers_df)
+# %%
+'''
+customers_df = pd.read_csv(f"../{SEED_CUSTOMERS}")
+transactions_df = pd.read_csv(f"../{SEED_TRANSACTIONS}")
+
+transactions_df = transform_transactions_df(transactions_df)
+customers_df = transform_customers_df(customers_df)
+'''
 
 # %%
+'''
 transactions_modeling_df, customers_modeling_df = build_training_base(
     seed_customers_path=f"../{SEED_CUSTOMERS}",
     seed_transactions_path=f"../{SEED_TRANSACTIONS}",
     train_snapshot_date=CUTOFF_DATE,
     churn_windows=[30],
 )
+'''
 
 # %%
+'''
 raw_features_df = build_customer_features(
     transactions_modeling_df,
     customers_modeling_df,
@@ -1788,10 +2338,14 @@ raw_features_df = build_customer_features(
         "days_since_first_transaction",
     ],
 )
+'''
 
 # %%
 #raw_features_df = raw_features_df.drop(columns=['signup_date', 'termination_date', 'true_lifetime_days', 'is_churn_30_days'])
 #raw_features_df = raw_features_df.set_index('customer_id', drop=True)
+
+# %%
+#raw_features_df.to_csv(BASE_GOLD_DIR / "clv" / "raw_features_df.csv", index=False)
 
 # %% [markdown]
 # ### Get duration and event features
@@ -1803,42 +2357,123 @@ raw_features_df = build_customer_features(
 # Just as before, "churn" time means the date where the customer stop interacting with the product,  `termination_date` computed using `true_lifetime_days`.
 
 # %%
+'''
 survival_df = add_duration_event(
     customers_df=raw_features_df,
     obs_end_date=MAX_DATA_DATE,
     start_col="signup_date",
     termination_col="termination_date"
 )
+'''
 
 # %%
+'''
 # Create eval set
 label_df = survival_df[['customer_id', 'is_churn_30_days']]
+'''
 
 # %%
+'''
 # Remove target columns
 survival_df = survival_df.drop(columns=['signup_date', 'termination_date', 'true_lifetime_days', 'is_churn_30_days'])
+'''
 
 # %%
+'''
 label_df = label_df.set_index('customer_id', drop=True)
 survival_df = survival_df.set_index('customer_id', drop=True)
+'''
+
+# %% [markdown]
+# ### Pipeline: Get raw survival_df and label_df
+
+# %%
+raw_survival_df, label_df = get_survival_clv_features_df(
+    seed_customers_path=f"../{SEED_CUSTOMERS}",
+    seed_transactions_path=f"../{SEED_TRANSACTIONS}",
+    cutoff_date=CUTOFF_DATE,
+    max_data_date=MAX_DATA_DATE,
+    churn_windows=[30],
+)
+
+# %%
+survival_features_labels = raw_survival_df.join(label_df)
+
+output_path = (
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "raw"
+    / "features.csv"
+)
+
+# create parent directories if they don't exist
+output_path.parent.mkdir(parents=True, exist_ok=True)
+
+survival_features_labels.to_csv(
+    output_path
+    ,index=False
+)
+
+# %%
+survival_features_labels = pd.read_csv(
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "raw"
+    / "features.csv"
+, index_col=0)
+
+# %% [markdown]
+# ## Split Data
+
+# %%
+customers_truths_df = raw_survival_df.join(label_df)
+customers_truths_df = customers_truths_df.reset_index()
+
+# %%
+(
+    X_train_raw,
+    X_val_raw,
+    X_test_raw,
+    y_train,
+    y_val,
+    y_test,
+) = split_train_test_val(
+    customers_modeling_df=customers_truths_df,
+    targets=targets,
+    test_size=0.33,
+    val_size=0.33,
+    random_state=42,
+)
 
 # %% [markdown]
 # ## Feature Transformation
 
+# %% [markdown]
+# ### Transform raw survival_df
+
 # %%
+'''
 feature_cols = [
     c for c in survival_df.columns
     if c not in {"customer_id", "T", "E"}
 ]
+'''
 
-# %%
+'''
 num_imputer = SimpleImputer(strategy="median")
 
 survival_df[feature_cols] = num_imputer.fit_transform(
     survival_df[feature_cols]
 )
+'''
 
-# %%
+'''
 corr_with_T = survival_df[feature_cols].corrwith(survival_df["T"]).abs()
 feature_cols = corr_with_T[corr_with_T < 0.95].index.tolist()
 
@@ -1849,41 +2484,120 @@ scaler = StandardScaler()
 survival_df[feature_cols] = scaler.fit_transform(
     survival_df[feature_cols]
 )
+'''
+
+'''
+survival_df = survival_df[feature_cols + ["T", "E"]]
+'''
 
 # %%
-survival_df = survival_df[feature_cols + ["T", "E"]]
+survival_pipeline = SurvivalFeaturePipeline()
+X_train_transformed = survival_pipeline.fit_transform(X_train_raw)
+
+# %%
+X_test_transformed = survival_pipeline.transform(X_test_raw)
+X_val_transformed = survival_pipeline.transform(X_val_raw)
+
+# %%
+split_dfs = {
+    'train': [X_train_transformed, y_train],
+    'test': [X_test_transformed, y_test],
+    'val': [X_val_transformed, y_val]
+}
 
 # %% [markdown]
-# ## Split Data
+# ### Log Transformers
 
 # %%
-customers_truths_df = survival_df.join(label_df)
+joblib.dump(
+    survival_pipeline,
+    BASE_GOLD_DIR / "clv" / "transformer.joblib"
+)
+
+# %% [markdown]
+# ## Data Pipeline
+
+# %% [markdown]
+# The previous steps are ignorable. I have composed it into a pipeline to get the necessary features.
 
 # %%
-customers_truths_df = customers_truths_df.reset_index()
+raw_survival_df, label_df = get_survival_clv_features_df(
+    seed_customers_path=f"../{SEED_CUSTOMERS}",
+    seed_transactions_path=f"../{SEED_TRANSACTIONS}",
+    cutoff_date=CUTOFF_DATE,
+    max_data_date=MAX_DATA_DATE,
+    churn_windows=[30],
+)
+survival_features_labels = raw_survival_df.join(label_df)
+
+# %%
+output_path = (
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "raw"
+    / "features.csv"
+)
+
+# create parent directories if they don't exist
+output_path.parent.mkdir(parents=True, exist_ok=True)
+
+survival_features_labels.to_csv(
+    output_path
+    ,index=True
+)
+
+# %%
+survival_features_labels = pd.read_csv(
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "raw"
+    / "features.csv"
+#    , index_col = 0
+)
 
 # %%
 (
-    X_train,
-    X_val,
-    X_test,
+    X_train_survival_raw,
+    X_val_survival_raw,
+    X_test_survival_raw,
     y_train,
     y_val,
     y_test
 ) = split_train_test_val(
-    customers_modeling_df=customers_truths_df,
-    targets=targets,
+    customers_modeling_df=survival_features_labels,
+    targets=['is_churn_30_days'],
     test_size=0.33,
     val_size=0.33,
     random_state=42,
 )
 
 # %%
-split_dfs = {
-    'train': [X_train, y_train],
-    'test': [X_test, y_test],
-    'val': [X_val, y_val]
-}
+survival_pipeline = SurvivalFeaturePipeline()
+X_train_survival_transformed = survival_pipeline.fit_transform(X_train_survival_raw)
+X_test_survival_transformed = survival_pipeline.transform(X_test_survival_raw)
+X_val_survival_transformed = survival_pipeline.transform(X_val_survival_raw)
+
+# %%
+output_path = (
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "transformed"
+    / "survival_pipeline.pkl"
+)
+
+output_path.parent.mkdir(parents=True, exist_ok=True)
+
+with open(output_path, "wb") as f:
+    cloudpickle.dump(survival_pipeline, f)
 
 # %% [markdown]
 # # Test Models
@@ -1897,7 +2611,7 @@ split_dfs = {
 # %%
 cph = CoxPHFitter(penalizer=0.1)
 cph.fit(
-    survival_df,
+    X_train_transformed,
     duration_col="T",
     event_col="E"
 )
@@ -1907,7 +2621,7 @@ cph.fit(
 
 # %%
 cox_surv_curves = cph.predict_survival_function(
-    survival_df[feature_cols]
+    X_train_transformed
 )
 
 # %%
@@ -1918,7 +2632,7 @@ cox_surv_curves
 
 # %%
 cox_expected_lifetime = cph.predict_expectation(
-    survival_df[feature_cols]
+    X_train_transformed
 )
 
 cox_expected_lifetime.name = "expected_remaining_lifetime_cox"
@@ -1935,7 +2649,7 @@ cox_expected_lifetime
 # %%
 aft = WeibullAFTFitter(penalizer=0.1)
 aft.fit(
-    survival_df,
+    X_train_transformed,
     duration_col="T",
     event_col="E"
 )
@@ -1945,7 +2659,7 @@ aft.fit(
 
 # %%
 weibull_surv_curves = aft.predict_survival_function(
-    survival_df[feature_cols]
+    X_train_transformed
 )
 
 # %%
@@ -1956,7 +2670,7 @@ weibull_surv_curves
 
 # %%
 weibull_expected_lifetime = aft.predict_expectation(
-    survival_df[feature_cols]
+    X_train_transformed
 )
 
 weibull_expected_lifetime.name = "expected_remaining_lifetime_weibull"
@@ -2047,6 +2761,126 @@ for split in split_dfs.keys():
 # %%
 predict_user_survival(
     customer_id="C00003",
-    survival_df=survival_df,
+    survival_df=X_train_transformed,
     model=aft,
+)
+
+# %% [markdown]
+# # Productionize
+
+# %% [markdown]
+# ## Setup Mlflow
+
+# %%
+mlflow.set_experiment(EXPERIMENT_NAME)
+
+# %% [markdown]
+# ## Model Tuning
+
+# %%
+split_dfs = {
+    'train': [X_train_survival_transformed, y_train],
+    'val': [X_val_survival_transformed, y_val],
+    'test': [X_test_survival_transformed, y_test]
+}
+
+# %%
+param_grid = {
+    "penalizer": [0.0, 0.01, 0.1, 1.0],
+    "l1_ratio": [0.0, 0.5, 1.0],
+}
+
+for penalizer, l1_ratio in product(
+    param_grid["penalizer"],
+    param_grid["l1_ratio"],
+):
+    cox_params = {
+        "penalizer": penalizer,
+        "l1_ratio": l1_ratio,
+    }
+
+    run_name = f"cox__h30__p{penalizer}__l1{l1_ratio}"
+
+    with mlflow.start_run(run_name=run_name):
+
+        mlflow.log_param("dataset_version", f"{MAX_DATA_DATE_STR}__cut_30d")
+
+        train_cox(
+            X_train=split_dfs["train"][0],
+            y_train=split_dfs["train"][1],
+            X_val=split_dfs["val"][0],
+            y_val=split_dfs["val"][1],
+            X_test=split_dfs["test"][0],
+            y_test=split_dfs["test"][1],
+            target="is_churn_30_days",
+            horizon_days=30,
+            model_params=cox_params,
+        )
+
+# %%
+param_grid = {
+    "penalizer": [0.0, 0.01, 0.1, 1.0],
+    "l1_ratio": [0.0, 0.5, 1.0],
+}
+
+for penalizer, l1_ratio in product(
+    param_grid["penalizer"],
+    param_grid["l1_ratio"],
+):
+    weibull_params = {
+        "penalizer": penalizer,
+        "l1_ratio": l1_ratio,
+    }
+
+    run_name = f"weibull__h30__p{penalizer}__l1{l1_ratio}"
+
+    with mlflow.start_run(run_name=run_name):
+
+        mlflow.log_param("dataset_version", f"{MAX_DATA_DATE_STR}__cut_30d")
+
+        train_weibull(
+            X_train=split_dfs["train"][0],
+            y_train=split_dfs["train"][1],
+            X_val=split_dfs["val"][0],
+            y_val=split_dfs["val"][1],
+            X_test=split_dfs["test"][0],
+            y_test=split_dfs["test"][1],
+            target="is_churn_30_days",
+            horizon_days=30,
+            model_params=weibull_params,
+        )
+
+# %% [markdown]
+# Screenshot from Mlflow:
+#
+# ![image.png](attachment:image.png)
+
+# %% [markdown]
+# ## Choose Production Model
+
+# %% [markdown]
+# Based on the tuning experiment, two best models so far for production are:
+# - weibull__h30__p0.01__l10.0
+#
+# ![image-5.png](attachment:image-5.png)
+#
+# I will promote Weibull to production because its performance technically slightly better than other models.
+
+# %%
+promote_to_production("7bf52a14feb9409882741249fc0046de")
+
+# %%
+model, metadata = load_survival_analysis_model()
+
+# %% [markdown]
+# ## Inference
+
+# %% [markdown]
+# On inference: Have to import the transformed_survival_df.csv for fast lookup.
+
+# %%
+predict_user_survival(
+    customer_id="C00013",
+    survival_df=X_train_survival_transformed,
+    model=model,
 )

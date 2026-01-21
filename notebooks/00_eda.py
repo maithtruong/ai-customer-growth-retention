@@ -56,6 +56,12 @@ import os
 # %%
 import maika_eda_pandas as mk
 
+# %%
+from src.core.transforms import get_customers_screenshot_summary_from_transactions_df
+
+# %%
+import plotly.express as px
+
 # %% [markdown]
 # ## Environment
 
@@ -127,6 +133,7 @@ mk.stack_plotly_figure_with_dataframe(stat_df, fig)
 # %%
 styled_df, fig = mk.frequency_table_and_bar(customers_df, 'termination_date')
 styled_df['termination_date'] = styled_df['termination_date'].dt.strftime('%Y-%m-%d')
+fig = mk.create_histogram_plotly(customers_df, 'termination_date')
 mk.stack_plotly_figure_with_styled_dataframe(fig, styled_df)
 
 # %% [markdown]
@@ -149,6 +156,8 @@ transactions_df['transaction_date'] = pd.to_datetime(transactions_df['transactio
 
 # %%
 styled_df, fig = mk.frequency_table_and_bar(transactions_df, 'transaction_date')
+styled_df['transaction_date'] = styled_df['transaction_date'].dt.strftime('%Y-%m-%d')
+fig = mk.create_histogram_plotly(transactions_df, 'transaction_date')
 mk.stack_plotly_figure_with_styled_dataframe(fig, styled_df)
 
 # %% [markdown]
@@ -180,7 +189,6 @@ data_timespans = {
 # %%
 data_timespans
 
-
 # %% [markdown]
 # ## Customer Behavior
 
@@ -194,71 +202,6 @@ data_timespans
 # - Monetary Values
 #
 # To choose a suitable method for setting segments.
-
-# %%
-def get_customers_screenshot_summary_from_transactions_df(
-    transactions_df: pd.DataFrame,
-    observed_date: pd.Timestamp,
-    column_names: list
-) -> pd.DataFrame:
-    """
-    Build a per-customer snapshot summary from a transactions DataFrame.
-
-    The function filters transactions up to the observed date and computes,
-    per customer:
-        - total transaction amount in the period
-        - first transaction date in the period
-        - last transaction date in the period
-        - number of transactions in the period
-        - days since last transaction until the observed date
-        - tenure in days within the observed period
-          (last transaction date minus first transaction date)
-
-    Parameters
-    ----------
-    transactions_df : pd.DataFrame
-        Input transactions data.
-    observed_date : pd.Timestamp
-        Cutoff date for the snapshot.
-    column_names : list
-        Column names in the following order:
-        [customer_id, transaction_date, amount]
-
-    Returns
-    -------
-    pd.DataFrame
-        Customer-level snapshot summary.
-    """
-
-    customer_col, transaction_date_col, amount_col = column_names
-
-    filtered_df = transactions_df[
-        transactions_df[transaction_date_col] <= observed_date
-    ]
-
-    summary_df = (
-        filtered_df
-        .groupby(customer_col, as_index=False)
-        .agg(
-            period_total_amount=(amount_col, 'sum'),
-            period_first_transaction_date=(transaction_date_col, 'min'),
-            period_last_transaction_date=(transaction_date_col, 'max'),
-            period_transaction_count=(customer_col, 'size')
-        )
-    )
-
-    summary_df['days_until_observed'] = (
-        observed_date - summary_df['period_last_transaction_date']
-    ).dt.days
-
-    summary_df['period_tenure_days'] = (
-        summary_df['period_last_transaction_date']
-        -
-        summary_df['period_first_transaction_date']
-    ).dt.days
-
-    return summary_df
-
 
 # %%
 customers_screenshot_summary_df = get_customers_screenshot_summary_from_transactions_df(

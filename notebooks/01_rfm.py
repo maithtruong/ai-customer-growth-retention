@@ -37,7 +37,13 @@ import os
 import maika_eda_pandas as mk
 
 # %%
-from src.core.transforms import get_customers_screenshot_summary_from_transactions_df
+from src.core.transforms import (
+    transform_transactions_df,
+    transform_customers_df,
+    get_customers_screenshot_summary_from_transactions_df,
+    rfm_segment,
+    add_churn_status,
+)
 
 # %%
 import plotly.express as px
@@ -74,26 +80,8 @@ mk.read_data_info(transactions_df)
 # %%
 mk.read_data_info(customers_df)
 
-
 # %% [markdown]
 # ### Transform
-
-# %%
-def transform_transactions_df(transactions_df):
-
-    transactions_df['transaction_date'] = pd.to_datetime(transactions_df['transaction_date'])
-    
-    return transactions_df
-
-
-# %%
-def transform_customers_df(customers_df):
-
-    customers_df['signup_date'] = pd.to_datetime(customers_df['signup_date'])
-    customers_df['termination_date'] = customers_df['signup_date'] + pd.to_timedelta(customers_df['true_lifetime_days'], unit='D')
-    
-    return customers_df
-
 
 # %%
 transactions_df = transform_transactions_df(transactions_df)
@@ -162,31 +150,8 @@ customers_screenshot_summary_df[score_cols] = (
 # %%
 customers_screenshot_summary_df[["customer_id"] + score_cols].head()
 
-
 # %% [markdown]
 # ### Assign Labels
-
-# %%
-def rfm_segment(row):
-    r, f, m = int(row["R_score"]), int(row["F_score"]), int(row["M_score"])
-
-    if r >= 4 and f >= 4 and m >= 4:
-        return "Champions"
-
-    if r >= 4 and f >= 3:
-        return "Loyal Customers"
-
-    if r >= 4 and f <= 2:
-        return "New Customers"
-
-    if r <= 2 and f >= 3:
-        return "At Risk"
-
-    if r <= 2 and f <= 2:
-        return "Hibernating"
-
-    return "Others"
-
 
 # %%
 customers_screenshot_summary_df['rfm_segment'] = customers_screenshot_summary_df.apply(rfm_segment, axis=1)
@@ -266,34 +231,12 @@ customers_df['true_lifetime_days'].mean()
     .format(precision=4)
 )
 
-
 # %% [markdown]
 # This data seem to have high linear correlation, meaning:
 # - Those who purchase higher in value is likely also purchased more frequently and have purchased recently.
 
 # %% [markdown]
 # ## RFM & Churn
-
-# %%
-def add_churn_status(
-        transformed_customers_df: pd.DataFrame,
-        desired_df: pd.DataFrame,
-        observed_date: pd.Timestamp
-    ):
-
-    output_df = pd.merge(
-        desired_df,
-        transformed_customers_df[['customer_id', 'termination_date']],
-        on='customer_id',
-        how='inner'
-    )
-
-    output_df['is_churn'] = (
-    output_df['termination_date'] <= observed_date
-    ).astype(int)
-
-    return output_df
-
 
 # %%
 customers_screenshot_summary_df = add_churn_status(customers_df, customers_screenshot_summary_df, OBSERVED_DATE)

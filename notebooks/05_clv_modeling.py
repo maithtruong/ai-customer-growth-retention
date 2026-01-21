@@ -75,7 +75,15 @@ from sklearn.model_selection import train_test_split
 from lifetimes import GammaGammaFitter
 
 # %%
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+
+# %%
 import mlflow
+
+# %%
+import traceback
 
 # %% [markdown]
 # ## Environment
@@ -102,20 +110,14 @@ BASE_GOLD_DIR = PROJECT_ROOT / "data" / "gold" / OBSERVED_DATE_STR
 
 # %%
 MLRUNS_DIR = PROJECT_ROOT / "mlruns"
-
-# %%
 mlflow.set_tracking_uri(f"file://{MLRUNS_DIR}")
+EXPERIMENT_NAME = "customer_monetary_modeling"
 
-# %%
-EXPERIMENT_NAME = "gamma-gamma"
+from mlflow.tracking import MlflowClient
+client = MlflowClient()
 
 # %%
 targets=['is_churn_30_days']
-
-# %%
-from mlflow.tracking import MlflowClient
-
-client = MlflowClient()
 
 
 # %% [markdown]
@@ -1786,6 +1788,96 @@ def cut_off_customers_and_transactions_df(
     return transactions_cut_df, customer_ids_cut
 
 
+# %%
+def get_bgf_clv_features_df(
+    transactions_path: str,
+    customers_path: str,
+    observed_date,
+    cutoff_days: int,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame, pd.Index]:
+    """
+    Load raw data, apply transformations, cut data by inactivity window,
+    build BG-NBD + RFM features, and optionally compute future CLV ground truth.
+
+    If cutoff_days == 0, future CLV ground truth is skipped.
+    """
+
+    # ======================
+    # Load & transform raw data
+    # ======================
+    transactions_df = pd.read_csv(transactions_path)
+    transactions_df = transform_transactions_df(transactions_df)
+
+    customers_df = pd.read_csv(customers_path)
+    customers_df = transform_customers_df(customers_df)
+
+    # ======================
+    # Define cutoff date
+    # ======================
+    cutoff_date = observed_date - pd.Timedelta(days=cutoff_days)
+
+    # ======================
+    # Cut customers & transactions
+    # ======================
+    transactions_cut_df, customer_ids_cut = cut_off_customers_and_transactions_df(
+        transactions_df=transactions_df,
+        customers_df=customers_df,
+        n_days=cutoff_days,
+        end_date=observed_date,
+    )
+
+    # ======================
+    # Lifetimes (BG-NBD) summary
+    # ======================
+    summary_cut_df = get_lifetimes_summary_df(
+        transactions_df=transactions_cut_df,
+        observed_date=cutoff_date,
+        column_names=["customer_id", "transaction_date"],
+    )
+
+    # ======================
+    # RFM features
+    # ======================
+    rfm_cut_df = get_customers_screenshot_summary_from_transactions_df(
+        transactions_df=transactions_cut_df,
+        observed_date=cutoff_date,
+        column_names=["customer_id", "transaction_date", "amount"],
+    )
+
+    summary_rfm_features_cut_df = summary_cut_df.merge(
+        rfm_cut_df,
+        on="customer_id",
+        how="inner",
+    )
+
+    # ======================
+    # Optional: Future CLV ground truth
+    # ======================
+    if cutoff_days > 0:
+        transactions_future_df = transactions_df.loc[
+            (transactions_df["transaction_date"] > cutoff_date) &
+            (transactions_df["transaction_date"] <= observed_date)
+        ]
+
+        truth_clv_df = (
+            transactions_future_df
+            .groupby("customer_id", as_index=False)
+            .agg(CLV_30d=("amount", "sum"))
+        )
+
+    else:
+        truth_clv_df = None
+
+    clv_features_cut_df = summary_rfm_features_cut_df.copy()
+
+    return (
+        clv_features_cut_df,
+        truth_clv_df,
+        transactions_cut_df,
+        customer_ids_cut,
+    )
+
+
 # %% [markdown]
 # ### Evaluate
 
@@ -2143,55 +2235,1074 @@ def predict_users_bg_nbd(
 
 
 # %% [markdown]
+# ## 04 Notebook Wrappers
+
+# %% [markdown]
+# ### Feature Engineering
+
+# %%
+def add_duration_event(
+    customers_df: pd.DataFrame,
+    obs_end_date: pd.Timestamp,
+    start_col: str = "signup_date",
+    termination_col: str = "termination_date",
+) -> pd.DataFrame:
+    df = customers_df.copy()
+
+    # Ensure datetime
+    df[start_col] = pd.to_datetime(df[start_col])
+    df[termination_col] = pd.to_datetime(df[termination_col])
+
+    # Event indicator: churn happened by obs_end_date
+    df["E"] = (
+        df[termination_col].notna()
+        & (df[termination_col] <= obs_end_date)
+    ).astype(int)
+
+    # End date for duration calculation
+    df["end_date"] = df[termination_col].where(
+        df["E"] == 1,
+        obs_end_date,
+    )
+
+    # Duration (in days)
+    df["T"] = (df["end_date"] - df[start_col]).dt.days
+
+    # Safety checks
+    if (df["T"] < 0).any():
+        raise ValueError("Negative durations found — check date logic")
+
+    return df.drop(columns=["end_date"])
+
+
+# %%
+def survival_to_churn_proba(
+    model,
+    X: pd.DataFrame,
+    horizon_days: int,
+) -> pd.Series:
+    """
+    Returns P(churn within horizon_days)
+    """
+
+    surv_fn = model.predict_survival_function(X)
+
+    probs = []
+    for i in range(surv_fn.shape[1]):
+        s = surv_fn.iloc[:, i]
+        s_h = (
+            s.loc[s.index <= horizon_days].iloc[-1]
+            if (s.index <= horizon_days).any()
+            else s.iloc[0]
+        )
+        probs.append(1 - s_h)
+
+    return pd.Series(probs, index=X.index, name="p_churn")
+
+
+# %%
+def build_survival_dataset(
+    seed_customers_path: str,
+    seed_transactions_path: str,
+    cutoff_date,
+    max_data_date,
+    churn_windows=[30],
+):
+    """
+    Build survival analysis dataset from customer & transaction CSV paths.
+
+    Returns
+    -------
+    survival_df : pd.DataFrame
+        Feature matrix indexed by customer_id, including duration & event columns
+    label_df : pd.DataFrame
+        Churn labels indexed by customer_id
+    """
+
+    # --- Load raw data ---
+    customers_df = pd.read_csv(seed_customers_path)
+    transactions_df = pd.read_csv(seed_transactions_path)
+
+    # --- Build modeling base ---
+    transactions_modeling_df, customers_modeling_df = build_training_base(
+        seed_customers_path=seed_customers_path,
+        seed_transactions_path=seed_transactions_path,
+        train_snapshot_date=cutoff_date,
+        churn_windows=list(churn_windows),
+    )
+
+    # --- Feature engineering ---
+    raw_features_df = build_customer_features(
+        transactions_modeling_df,
+        customers_modeling_df,
+        observed_date=cutoff_date,
+    )
+
+    # --- Add survival targets (T, E) ---
+    survival_df = add_duration_event(
+        customers_df=raw_features_df,
+        obs_end_date=max_data_date,
+        start_col="signup_date",
+        termination_col="termination_date",
+    )
+
+    # --- Extract labels ---
+    label_cols = [f"is_churn_{w}_days" for w in churn_windows]
+    label_df = survival_df[["customer_id", *label_cols]].set_index("customer_id")
+
+    # --- Drop target / leakage columns ---
+    survival_df = survival_df.drop(
+        columns=[
+            "signup_date",
+            "termination_date",
+            "true_lifetime_days",
+            *label_cols,
+        ]
+    ).set_index("customer_id")
+
+    return survival_df, label_df
+
+
+# %%
+class SurvivalFeaturePipeline(BaseEstimator, TransformerMixin):
+    """
+    Feature transformation pipeline for survival analysis.
+
+    Steps:
+    1. Select feature columns (exclude T, E)
+    2. Median imputation
+    3. Drop features highly correlated with T
+    4. Drop near-zero variance features
+    5. Standard scaling
+    """
+
+    def __init__(
+        self,
+        corr_threshold: float = 0.95,
+        std_threshold: float = 1e-6,
+    ):
+        self.corr_threshold = corr_threshold
+        self.std_threshold = std_threshold
+
+        self.imputer = SimpleImputer(strategy="median")
+        self.scaler = StandardScaler()
+
+        # learned attributes
+        self.feature_cols_ = None
+        self.keep_cols_ = None
+
+    def fit(self, raw_survival_df: pd.DataFrame, y=None):
+        df = raw_survival_df.copy()
+
+        # --- identify feature columns ---
+        self.feature_cols_ = [
+            c for c in df.columns if c not in {"customer_id", "T", "E"}
+        ]
+
+        # --- imputation (fit only) ---
+        X = self.imputer.fit_transform(df[self.feature_cols_])
+        X = pd.DataFrame(X, columns=self.feature_cols_, index=df.index)
+
+        # --- correlation with T ---
+        corr_with_T = X.corrwith(df["T"]).abs()
+        keep = corr_with_T[corr_with_T < self.corr_threshold].index
+
+        # --- variance filter ---
+        std = X[keep].std()
+        self.keep_cols_ = std[std > self.std_threshold].index.tolist()
+
+        # --- fit scaler ---
+        self.scaler.fit(X[self.keep_cols_])
+
+        return self
+
+    def transform(self, raw_survival_df: pd.DataFrame):
+        df = raw_survival_df.copy()
+
+        X = pd.DataFrame(
+            self.imputer.transform(df[self.feature_cols_]),
+            columns=self.feature_cols_,
+            index=df.index,
+        )
+
+        X = self.scaler.transform(X[self.keep_cols_])
+        X = pd.DataFrame(X, columns=self.keep_cols_, index=df.index)
+
+        return pd.concat(
+            [X, df[["T", "E"]]],
+            axis=1,
+        )
+
+
+# %% [markdown]
+# ### Evaluation
+
+# %%
+def evaluate_churn_predictions(
+    feature_df: pd.DataFrame,
+    target_df: pd.DataFrame | None = None,
+    threshold: float = 0.5,
+    target_col: str = "is_churn",
+    proba_col: str = "p_churn",
+):
+    """
+    feature_df: must contain [proba_col]
+    target_df:
+        - if provided: must contain [target_col]
+        - if None: target_col must already be in feature_df
+
+    Assumes customer_id is the index in both DataFrames.
+    """
+
+    # Decide where labels come from
+    if target_df is None:
+        missing = {target_col, proba_col} - set(feature_df.columns)
+        if missing:
+            raise ValueError(
+                f"feature_df is missing required columns: {missing}"
+            )
+        eval_df = feature_df.copy()
+
+    else:
+        missing_f = {proba_col} - set(feature_df.columns)
+        missing_t = {target_col} - set(target_df.columns)
+
+        if missing_f or missing_t:
+            raise ValueError(
+                f"Missing columns — "
+                f"feature_df: {missing_f}, target_df: {missing_t}"
+            )
+
+        # Index-based alignment
+        eval_df = feature_df.join(
+            target_df[[target_col]],
+            how="inner"
+        )
+
+    # Binary predictions
+    eval_df["pred_churn"] = (eval_df[proba_col] >= threshold).astype(int)
+
+    # Metrics
+    metrics = {
+        "roc_auc": roc_auc_score(
+            eval_df[target_col],
+            eval_df[proba_col]
+        ),
+        "pr_auc": average_precision_score(
+            eval_df[target_col],
+            eval_df[proba_col]
+        ),
+        "precision": precision_score(
+            eval_df[target_col],
+            eval_df["pred_churn"]
+        ),
+        "recall": recall_score(
+            eval_df[target_col],
+            eval_df["pred_churn"]
+        ),
+    }
+
+    # Confusion matrix
+    cm = confusion_matrix(
+        eval_df[target_col],
+        eval_df["pred_churn"],
+        labels=[0, 1]
+    )
+
+    cm_df = pd.DataFrame(
+        cm,
+        index=["actual_no_churn", "actual_churn"],
+        columns=["pred_no_churn", "pred_churn"]
+    )
+
+    return metrics, cm_df, eval_df
+
+
+# %% [markdown]
+# ### Inference
+
+# %%
+def train_cox(
+    X_train: pd.DataFrame,
+    y_train: pd.DataFrame | None = None,
+    X_val: pd.DataFrame | None = None,
+    y_val: pd.DataFrame | None = None,
+    X_test: pd.DataFrame | None = None,
+    y_test: pd.DataFrame | None = None,
+    target: str = "is_churn_30_days",
+    horizon_days: int = 30,
+    threshold: float = 0.5,
+    model_params: dict | None = None,
+):
+    """
+    Trains a Cox model and evaluates churn when labels are available.
+    """
+
+    model_params = model_params or {}
+    mlflow.log_param("model_type", "cox")
+
+    try:
+        # ======================
+        # Train Cox
+        # ======================
+        cph = CoxPHFitter(**model_params)
+        cph.fit(
+            X_train,
+            duration_col="T",
+            event_col="E",
+        )
+
+        proba_col = f"p_churn_{horizon_days}_days"
+
+        # ======================
+        # Add predictions (IN PLACE)
+        # ======================
+        X_train[proba_col] = survival_to_churn_proba(
+            model=cph,
+            X=X_train,
+            horizon_days=horizon_days,
+        )
+
+        if X_val is not None:
+            X_val[proba_col] = survival_to_churn_proba(
+                model=cph,
+                X=X_val,
+                horizon_days=horizon_days,
+            )
+
+        if X_test is not None:
+            X_test[proba_col] = survival_to_churn_proba(
+                model=cph,
+                X=X_test,
+                horizon_days=horizon_days,
+            )
+
+        # ======================
+        # Evaluation helper
+        # ======================
+        def evaluate(X, y, split_name):
+            if X is None or y is None:
+                return None
+
+            metrics, cm_df, eval_df = evaluate_churn_predictions(
+                feature_df=X,
+                target_df=y,
+                threshold=threshold,
+                target_col=target,
+                proba_col=proba_col,
+            )
+
+            for k, v in metrics.items():
+                mlflow.log_metric(f"{split_name}_{k}", v)
+
+            mlflow.log_text(
+                cm_df.to_string(),
+                artifact_file=f"confusion_matrix/{split_name}_churn.txt",
+            )
+
+            return metrics, cm_df
+
+        results = {
+            "model": cph,
+            "train": evaluate(X_train, y_train, "train"),
+        }
+
+        if X_val is not None and y_val is not None:
+            results["val"] = evaluate(X_val, y_val, "val")
+
+        if X_test is not None and y_test is not None:
+            results["test"] = evaluate(X_test, y_test, "test")
+
+        # ======================
+        # MLflow logging
+        # ======================
+        mlflow.log_param("target", target)
+        mlflow.log_param("horizon_days", horizon_days)
+        mlflow.log_param("threshold", threshold)
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        log_lifetimes_model(cph)
+
+        mlflow.set_tag("run_status", "success")
+
+        return results
+
+    except Exception as e:
+        # ======================
+        # Failure handling
+        # ======================
+        error_msg = traceback.format_exc()
+
+        mlflow.set_tag("run_status", "failed")
+        mlflow.log_text(error_msg, artifact_file="training_error.txt")
+
+        # Still log params so you know what failed
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        # Optional: surface error in logs, but do NOT crash grid search
+        print(f"[WARN] Cox training failed with params={model_params}")
+        print(e)
+
+        return None
+
+
+# %%
+def train_weibull(
+    X_train: pd.DataFrame,
+    y_train: pd.DataFrame | None = None,
+    X_val: pd.DataFrame | None = None,
+    y_val: pd.DataFrame | None = None,
+    X_test: pd.DataFrame | None = None,
+    y_test: pd.DataFrame | None = None,
+    target: str = "is_churn_30_days",
+    horizon_days: int = 30,
+    threshold: float = 0.5,
+    model_params: dict | None = None,
+):
+    """
+    Trains a Weibull AFT model and evaluates churn when labels are available.
+    """
+
+    model_params = model_params or {}
+    mlflow.log_param("model_type", "weibull")
+
+    try:
+        # ======================
+        # Train Weibull
+        # ======================
+        model = WeibullAFTFitter(**model_params)
+        model.fit(
+            X_train,
+            duration_col="T",
+            event_col="E",
+        )
+
+        proba_col = f"p_churn_{horizon_days}_days"
+
+        # ======================
+        # Add predictions (IN PLACE)
+        # ======================
+        X_train[proba_col] = survival_to_churn_proba(
+            model=model,
+            X=X_train,
+            horizon_days=horizon_days,
+        )
+
+        if X_val is not None:
+            X_val[proba_col] = survival_to_churn_proba(
+                model=model,
+                X=X_val,
+                horizon_days=horizon_days,
+            )
+
+        if X_test is not None:
+            X_test[proba_col] = survival_to_churn_proba(
+                model=model,
+                X=X_test,
+                horizon_days=horizon_days,
+            )
+
+        # ======================
+        # Evaluation helper
+        # ======================
+        def evaluate(X, y, split_name):
+            if X is None or y is None:
+                return None
+
+            metrics, cm_df, eval_df = evaluate_churn_predictions(
+                feature_df=X,
+                target_df=y,
+                threshold=threshold,
+                target_col=target,
+                proba_col=proba_col,
+            )
+
+            for k, v in metrics.items():
+                mlflow.log_metric(f"{split_name}_{k}", v)
+
+            mlflow.log_text(
+                cm_df.to_string(),
+                artifact_file=f"confusion_matrix/{split_name}_churn.txt",
+            )
+
+            return metrics, cm_df
+
+        results = {
+            "model": model,
+            "train": evaluate(X_train, y_train, "train"),
+        }
+
+        if X_val is not None and y_val is not None:
+            results["val"] = evaluate(X_val, y_val, "val")
+
+        if X_test is not None and y_test is not None:
+            results["test"] = evaluate(X_test, y_test, "test")
+
+        # ======================
+        # MLflow logging
+        # ======================
+        mlflow.log_param("target", target)
+        mlflow.log_param("horizon_days", horizon_days)
+        mlflow.log_param("threshold", threshold)
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        log_lifetimes_model(model)
+
+        mlflow.set_tag("run_status", "success")
+
+        return results
+
+    except Exception as e:
+        # ======================
+        # Failure handling
+        # ======================
+        error_msg = traceback.format_exc()
+
+        mlflow.set_tag("run_status", "failed")
+        mlflow.log_text(error_msg, artifact_file="training_error.txt")
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        print(f"[WARN] Weibull training failed with params={model_params}")
+        print(e)
+
+        return None
+
+
+# %%
+def log_lifetimes_model(model, filename: str = "model.pkl"):
+    tmp_path = Path(filename)
+
+    with open(tmp_path, "wb") as f:
+        cloudpickle.dump(model, f)
+
+    mlflow.log_artifact(
+        local_path=str(tmp_path),
+        artifact_path="model"
+    )
+
+    tmp_path.unlink()  # cleanup
+
+
+# %%
+def predict_user_survival(
+    customer_id: str,
+    survival_df: pd.DataFrame,
+    model,
+    horizons: list[int] = [30, 60, 90],
+) -> dict:
+    """
+    Returns survival curve at given horizons + expected remaining lifetime
+    """
+
+    # Extract row
+    row = survival_df.loc[customer_id]
+
+    if row.empty:
+        raise ValueError(f"Customer {customer_id} not found")
+
+    X = row.drop(columns=["customer_id", "T", "E"], errors="ignore")
+
+    # Survival function (continuous)
+    surv_fn = model.predict_survival_function(X)
+
+    # Discrete horizon extraction
+    survival_curve = []
+    for h in horizons:
+        prob = float(
+            surv_fn.loc[surv_fn.index <= h].iloc[-1, 0]
+            if (surv_fn.index <= h).any()
+            else surv_fn.iloc[0, 0]
+        )
+        survival_curve.append(
+            {"day": h, "prob": round(prob, 4)}
+        )
+
+    # Expected remaining lifetime
+    expected_lifetime = float(
+        model.predict_expectation(X).iloc[0]
+    )
+
+    return {
+        "survival_curve": survival_curve,
+        "expected_remaining_lifetime": round(expected_lifetime, 2),
+    }
+
+
+# %%
+def load_survival_analysis_model():
+    exp = mlflow.get_experiment_by_name("customer_lifetime_modeling")
+    if exp is None:
+        raise ValueError(f"Experiment {exp} not found")
+
+    runs = mlflow.search_runs(
+        experiment_ids=[exp.experiment_id],
+        filter_string="tags.stage = 'production'",
+        output_format="pandas",
+    )
+
+    if runs.empty:
+        raise ValueError("No production run found")
+
+    run = runs.iloc[0]
+    run_id = run["run_id"]
+
+    metadata = {
+        "run_id": run_id,
+        "experiment_id": exp.experiment_id,
+        "experiment_name": exp.name,
+        "params": run.filter(like="params.").to_dict(),
+        "metrics": run.filter(like="metrics.").to_dict(),
+        "tags": run.filter(like="tags.").to_dict(),
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+
+        path = mlflow.artifacts.download_artifacts(
+            run_id=run_id,
+            artifact_path="model/model.pkl",
+            dst_path=d,
+        )
+        model = cloudpickle.load(open(path, "rb"))
+
+    return model, metadata
+
+
+# %%
+def load_gamma_gamma_model():
+    exp = mlflow.get_experiment_by_name("customer_monetary_modeling")
+    if exp is None:
+        raise ValueError(f"Experiment {exp} not found")
+
+    runs = mlflow.search_runs(
+        experiment_ids=[exp.experiment_id],
+        filter_string="tags.stage = 'production'",
+        output_format="pandas",
+    )
+
+    if runs.empty:
+        raise ValueError("No production run found")
+
+    run = runs.iloc[0]
+    run_id = run["run_id"]
+
+    metadata = {
+        "run_id": run_id,
+        "experiment_id": exp.experiment_id,
+        "experiment_name": exp.name,
+        "params": run.filter(like="params.").to_dict(),
+        "metrics": run.filter(like="metrics.").to_dict(),
+        "tags": run.filter(like="tags.").to_dict(),
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+
+        path = mlflow.artifacts.download_artifacts(
+            run_id=run_id,
+            artifact_path="model/model.pkl",
+            dst_path=d,
+        )
+        model = cloudpickle.load(open(path, "rb"))
+
+    return model, metadata
+
+
+# %% [markdown]
+# ## Wrapper
+
+# %%
+def get_survival_clv_features_df(
+    seed_customers_path: str,
+    seed_transactions_path: str,
+    cutoff_date,
+    max_data_date,
+    churn_windows=[30],
+):
+    """
+    Build survival analysis dataset from customer & transaction CSV paths.
+
+    Returns
+    -------
+    survival_df : pd.DataFrame
+        Feature matrix indexed by customer_id, including duration & event columns
+    label_df : pd.DataFrame
+        Churn labels indexed by customer_id
+    """
+
+    # --- Load raw data ---
+    customers_df = pd.read_csv(seed_customers_path)
+    transactions_df = pd.read_csv(seed_transactions_path)
+
+    # --- Build modeling base ---
+    transactions_modeling_df, customers_modeling_df = build_training_base(
+        seed_customers_path=seed_customers_path,
+        seed_transactions_path=seed_transactions_path,
+        train_snapshot_date=cutoff_date,
+        churn_windows=list(churn_windows),
+    )
+
+    # --- Feature engineering ---
+    # --- Add transaction features ---
+    raw_features_df = build_customer_features(
+        transactions_modeling_df,
+        customers_modeling_df,
+        observed_date=cutoff_date,
+    )
+
+    # --- Add RFM features ---
+    rfm_features_df = get_customers_screenshot_summary_from_transactions_df(
+        transactions_df=transactions_modeling_df,
+        observed_date=cutoff_date,
+        column_names=["customer_id", "transaction_date", "amount"],
+    )
+
+    # --- Add survival targets (T, E) ---
+    survival_df = add_duration_event(
+        customers_df=raw_features_df,
+        obs_end_date=max_data_date,
+        start_col="signup_date",
+        termination_col="termination_date",
+    )
+
+    # --- Merge datasets ---
+    survival_df = survival_df.merge(
+        rfm_features_df,
+        on="customer_id",
+        how="inner"
+    )
+
+    # --- Extract labels ---
+    label_cols = [f"is_churn_{w}_days" for w in churn_windows]
+    label_df = survival_df[["customer_id", *label_cols]].set_index("customer_id")
+
+    # --- Drop target / leakage columns ---
+    survival_df = survival_df.drop(
+        columns=[
+            "signup_date",
+            "termination_date",
+            "true_lifetime_days",
+            "period_first_transaction_date",
+            "period_last_transaction_date",
+            "days_until_observed",
+            *label_cols,
+        ]
+    ).set_index("customer_id")
+
+    return survival_df, label_df
+
+
+# %%
+def predict_survival_clv(
+    survival_model,
+    ggf,
+    X,
+    horizon_days=30,
+    frequency_col="period_transaction_count",
+    tenure_col="T"
+):
+    surv = survival_model.predict_survival_function(X)
+
+    expected_aov = ggf.conditional_expected_average_profit(
+        X["period_transaction_count"],
+        X["period_total_amount"],
+    )
+
+    lambda_rate = X[frequency_col] / X[tenure_col]
+
+    clv = []
+    for i in range(len(X)):
+        s = surv.iloc[:, i]
+        s = s.loc[s.index <= horizon_days]
+
+        clv_i = (
+            expected_aov.iloc[i]
+            * lambda_rate.iloc[i]
+            * s.sum()
+        )
+        clv.append(clv_i)
+
+    return pd.Series(clv, index=X.index)
+
+
+# %%
+def train_gamma_gamma(
+    X_train: pd.DataFrame,
+    model_params: dict | None = None,
+):
+    """
+    Trains a Gamma-Gamma model for monetary value.
+    Logs likelihood-based metrics only.
+    """
+
+    model_params = model_params or {}
+
+    mlflow.log_param("model_type", "gamma_gamma")
+
+    try:
+        # ======================
+        # Data selection (MANDATORY)
+        # ======================
+        summary_gg = X_train[
+            (X_train["period_transaction_count"] > 0)
+            &
+            (X_train["period_total_amount"] > 0)
+        ].copy()
+
+        mlflow.log_metric("n_customers_train", len(summary_gg))
+
+        # ======================
+        # Train Gamma-Gamma
+        # ======================
+        ggf = GammaGammaFitter(**model_params)
+
+        ggf.fit(
+            frequency=summary_gg["period_transaction_count"],
+            monetary_value=summary_gg["period_total_amount"],
+        )
+
+        # ======================
+        # Evaluation (LIKELIHOOD)
+        # ======================
+        nll = float(ggf._negative_log_likelihood_)
+        mlflow.log_metric("neg_log_likelihood", nll)
+
+        # Optional sanity metrics
+        avg_monetary_pred = float(
+            ggf.conditional_expected_average_profit(
+                summary_gg["period_transaction_count"],
+                summary_gg["period_total_amount"],
+            ).mean()
+        )
+        mlflow.log_metric("avg_predicted_monetary_value", avg_monetary_pred)
+
+        # ======================
+        # Log parameters
+        # ======================
+        for k, v in ggf.params_.items():
+            mlflow.log_metric(f"param_{k}", float(v))
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        # ======================
+        # Model artifact
+        # ======================
+        log_lifetimes_model(ggf)
+
+        mlflow.set_tag("run_status", "success")
+
+        return {
+            "model": ggf,
+            "neg_log_likelihood": nll,
+        }
+
+    except Exception:
+        error_msg = traceback.format_exc()
+
+        mlflow.set_tag("run_status", "failed")
+        mlflow.log_text(error_msg, artifact_file="training_error.txt")
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        print("[WARN] Gamma-Gamma training failed")
+        print(error_msg)
+
+        return None
+
+
+# %%
+def train_gamma_gamma(
+    X_train: pd.DataFrame,
+    model_params: dict | None = None,
+):
+    """
+    Trains a Gamma-Gamma model for monetary value.
+    Logs likelihood-based metrics only.
+    """
+
+    model_params = model_params or {}
+
+    mlflow.log_param("model_type", "gamma_gamma")
+
+    try:
+        # ======================
+        # Data selection (MANDATORY)
+        # ======================
+        summary_gg = X_train[
+            (X_train["period_transaction_count"] > 0)
+            &
+            (X_train["period_total_amount"] > 0)
+        ].copy()
+
+        mlflow.log_metric("n_customers_train", len(summary_gg))
+
+        # ======================
+        # Train Gamma-Gamma
+        # ======================
+        ggf = GammaGammaFitter(**model_params)
+
+        ggf.fit(
+            frequency=summary_gg["period_transaction_count"],
+            monetary_value=summary_gg["period_total_amount"],
+        )
+
+        # ======================
+        # Evaluation (LIKELIHOOD)
+        # ======================
+        nll = float(ggf._negative_log_likelihood_)
+        mlflow.log_metric("neg_log_likelihood", nll)
+
+        # Optional sanity metrics
+        avg_monetary_pred = float(
+            ggf.conditional_expected_average_profit(
+                summary_gg["period_transaction_count"],
+                summary_gg["period_total_amount"],
+            ).mean()
+        )
+        mlflow.log_metric("avg_predicted_monetary_value", avg_monetary_pred)
+
+        # ======================
+        # Log parameters
+        # ======================
+        for k, v in ggf.params_.items():
+            mlflow.log_metric(f"param_{k}", float(v))
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        # ======================
+        # Model artifact
+        # ======================
+        log_lifetimes_model(ggf)
+
+        mlflow.set_tag("run_status", "success")
+
+        return {
+            "model": ggf,
+            "neg_log_likelihood": nll,
+        }
+
+    except Exception:
+        error_msg = traceback.format_exc()
+
+        mlflow.set_tag("run_status", "failed")
+        mlflow.log_text(error_msg, artifact_file="training_error.txt")
+
+        for k, v in model_params.items():
+            mlflow.log_param(k, v)
+
+        print("[WARN] Gamma-Gamma training failed")
+        print(error_msg)
+
+        return None
+
+
+# %%
+def load_models_once():
+    if MODEL_STORE:
+        return  # already loaded
+
+    MODEL_STORE["ggf"], MODEL_STORE["ggf_meta"] = load_gamma_gamma_model()
+    MODEL_STORE["bgf"], MODEL_STORE["bgf_meta"] = load_prod_bg_nbd()
+    MODEL_STORE["survival"], MODEL_STORE["survival_meta"] = load_survival_analysis_model()
+
+
+# %%
+def estimate_clv(
+    customer_id: str,
+    method: str,
+    horizon_days: int = 30,
+    BASE_GOLD_DIR: str = BASE_GOLD_DIR
+) -> dict:
+
+    load_models_once()  # no-op after first call
+
+    ggf = MODEL_STORE["ggf"]
+
+    if method == "bgnbd":
+        bgf = MODEL_STORE["bgf"]
+
+        input_path = (
+            BASE_GOLD_DIR
+            / "cut_30d"
+            / "features"
+            / "clv"
+            / "bgf_gg"
+            / "raw"
+            / "features.csv"
+        )
+
+    elif method == "survival":
+        survival_model = MODEL_STORE["survival"]
+
+        input_path = (
+            BASE_GOLD_DIR
+            / "cut_30d"
+            / "features"
+            / "clv"
+            / "survival_gg"
+            / "transformed"
+            / "features.csv"
+        )
+
+    else:
+        raise ValueError("method must be 'bgnbd' or 'survival'")
+
+    X = pd.read_csv(input_path, index_col="customer_id")
+    X_cust = X.loc[[customer_id]]
+
+    if method == "bgnbd":
+        clv = ggf.customer_lifetime_value(
+            bgf,
+            X_cust["frequency"],
+            X_cust["recency"],
+            X_cust["T"],
+            X_cust["period_total_amount"],
+            time=horizon_days,
+            discount_rate=0.0,
+            freq="D",
+        ).iloc[0]
+    else:
+        clv = predict_survival_clv(
+            survival_model,
+            ggf,
+            X_cust,
+            horizon_days=horizon_days,
+        ).iloc[0]
+
+    return {
+        "customer_id": customer_id,
+        "method": method,
+        "clv": round(float(clv), 2),
+        "horizon_days": horizon_days,
+    }
+
+
+# %% [markdown]
 # ## Data
 
 # %% [markdown]
-# ### Read Seed Data
+# ### Pipeline 1: For BG-NBD model
 
 # %%
-transactions_df = pd.read_csv(f"../{SEED_TRANSACTIONS}")
-transactions_df = transform_transactions_df(transactions_df)
-
-# %%
-customers_df = pd.read_csv(f"../{SEED_CUSTOMERS}")
-customers_df = transform_customers_df(customers_df)
-
-# %%
-summary_cut_30d_df = pd.read_csv(BASE_GOLD_DIR / "clv" / "summary_cut_30d_df.csv")
-
-# %%
-rfm_cut_30d_df = get_customers_screenshot_summary_from_transactions_df(
-    transactions_df=transactions_df,
-    observed_date=CUTOFF_DATE,
-    column_names=["customer_id", "transaction_date", "amount"]
+(
+    clv_features_cut_30d_df,
+    truth_clv_30d_df,
+    transactions_30d_cut_df,
+    customer_ids_30d_cut,
+) = get_bgf_clv_features_df(
+    transactions_path=f"../{SEED_TRANSACTIONS}",
+    customers_path=f"../{SEED_CUSTOMERS}",
+    observed_date=OBSERVED_DATE,
+    cutoff_days=30
 )
-
-# %%
-clv_features_cut_30d_df = pd.merge(
-    summary_cut_30d_df,
-    rfm_cut_30d_df,
-    on='customer_id',
-    how='inner'
-)
-
-# %%
-transactions_window_30d_df = transactions_df.loc[
-    (transactions_df["transaction_date"] > CUTOFF_DATE) &
-    (transactions_df["transaction_date"] <= OBSERVED_DATE)
-]
-
-# %%
-truth_clv_30d_df = (
-    transactions_window_30d_df
-    .groupby("customer_id", as_index=False)
-    .agg(CLV_30d=("amount", "sum"))
-)
-
-# %%
-clv_features_cut_30d_df
-
-# %% [markdown]
-# ### Split data
 
 # %%
 clv_features_cut_30d_df = clv_features_cut_30d_df.merge(
@@ -2201,10 +3312,32 @@ clv_features_cut_30d_df = clv_features_cut_30d_df.merge(
 )
 
 # %%
+output_path = (
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "bgf_gg"
+    / "raw"
+    / "features.csv"
+)
+
+# create parent directories if they don't exist
+output_path.parent.mkdir(parents=True, exist_ok=True)
+
+clv_features_cut_30d_df.to_csv(
+    output_path
+    ,index=False
+)
+
+# %% [markdown]
+# ### Split dfs
+
+# %%
 (
-    X_train,
-    X_val,
-    X_test,
+    X_train_bgf,
+    X_val_bgf,
+    X_test_bgf,
     y_train,
     y_val,
     y_test
@@ -2215,6 +3348,80 @@ clv_features_cut_30d_df = clv_features_cut_30d_df.merge(
     val_size=0.33,
     random_state=42,
 )
+
+# %% [markdown]
+# ### Pipeline 2: For Survival model
+
+# %%
+survival_features_labels = pd.read_csv(
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "raw"
+    / "features.csv"
+, index_col=0)
+
+# %%
+label_df = survival_features_labels[['is_churn_30_days']]
+raw_survival_df = survival_features_labels.drop(columns=['is_churn_30_days'])
+
+# %%
+X_train_survival_raw = raw_survival_df.loc[X_train_bgf.index]
+X_val_survival_raw   = raw_survival_df.loc[X_val_bgf.index]
+X_test_survival_raw  = raw_survival_df.loc[X_test_bgf.index]
+
+# %%
+input_path = (
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "transformed"
+    / "survival_pipeline.pkl"
+)
+
+with open(input_path, "rb") as f:
+    survival_pipeline = cloudpickle.load(f)
+
+X_train_survival_transformed = survival_pipeline.transform(X_train_survival_raw)
+X_test_survival_transformed = survival_pipeline.transform(X_test_survival_raw)
+X_val_survival_transformed = survival_pipeline.transform(X_val_survival_raw)
+
+# %% [markdown]
+# ### Write down transformed data
+
+# %% [markdown]
+# The models need this dataset for inference, so I will write it down.
+
+# %%
+transformed_survival_df = survival_pipeline.transform(raw_survival_df)
+
+output_path = (
+    BASE_GOLD_DIR
+    / "cut_30d"
+    / "features"
+    / "clv"
+    / "survival_gg"
+    / "transformed"
+    / "features.csv"
+)
+
+# create parent directories if they don't exist
+output_path.parent.mkdir(parents=True, exist_ok=True)
+
+transformed_survival_df.to_csv(
+    output_path
+    ,index=True
+)
+
+# %%
+clv_features_cut_30d_df
+
+# %% [markdown]
+# # Log Gamma-Gamma Model
 
 # %% [markdown]
 # # Approach 1 - BG-NBD + Gamma–Gamma
@@ -2237,65 +3444,66 @@ bgf, metadata = load_prod_bg_nbd()
 # %%
 ggf = GammaGammaFitter(penalizer_coef=0.01)
 
-summary_gg = X_train[X_train["period_total_amount"] > 0]
+summary_gg = X_train_bgf[X_train_bgf["period_total_amount"] > 0]
 
 ggf.fit(
     summary_gg["period_transaction_count"],
     summary_gg["period_total_amount"],
 )
 
+
 # %%
-X_train.loc[summary_gg.index, "expected_avg_order_value"] = (
+'''
+
+X_train_bgf.loc[summary_gg.index, "expected_avg_order_value"] = (
     ggf.conditional_expected_average_profit(
         summary_gg["period_transaction_count"],
         summary_gg["period_total_amount"],
     )
 )
 
-# %%
-X_train["pred_CLV_30d"] = ggf.customer_lifetime_value(
+X_train_bgf["pred_CLV_30d"] = ggf.customer_lifetime_value(
     bgf,
-    X_train["frequency"],
-    X_train["recency"],
-    X_train["T"],
-    X_train["period_total_amount"],
+    X_train_bgf["frequency"],
+    X_train_bgf["recency"],
+    X_train_bgf["T"],
+    X_train_bgf["period_total_amount"],
     time=30,
     discount_rate=0.0,
     freq="D"
 )
 
-# %%
-X_test["pred_CLV_30d"] = ggf.customer_lifetime_value(
+X_test_bgf["pred_CLV_30d"] = ggf.customer_lifetime_value(
     bgf,
-    X_test["frequency"],
-    X_test["recency"],
-    X_test["T"],
-    X_test["period_total_amount"],
+    X_test_bgf["frequency"],
+    X_test_bgf["recency"],
+    X_test_bgf["T"],
+    X_test_bgf["period_total_amount"],
     time=30,
     discount_rate=0.0,
     freq="D"
 )
 
-# %%
-X_val["pred_CLV_30d"] = ggf.customer_lifetime_value(
+X_val_bgf["pred_CLV_30d"] = ggf.customer_lifetime_value(
     bgf,
-    X_val["frequency"],
-    X_val["recency"],
-    X_val["T"],
-    X_val["period_total_amount"],
+    X_val_bgf["frequency"],
+    X_val_bgf["recency"],
+    X_val_bgf["T"],
+    X_val_bgf["period_total_amount"],
     time=30,
     discount_rate=0.0,
     freq="D"
 )
+'''
 
 # %% [markdown]
 # ### Evaluate performance
 
 # %%
 split_dfs = {
-    'train': [X_train, y_train],
-    'test': [X_test, y_test],
-    'val': [X_val, y_val]
+    'train': [X_train_bgf, y_train],
+    'test': [X_test_bgf, y_test],
+    'val': [X_val_bgf, y_val]
 }
 
 # %%
@@ -2304,9 +3512,19 @@ for split in split_dfs.keys():
 
     print(f'Evaluation results for {split} set:')
 
-    X = split_dfs[split][0]
+    X = split_dfs[split][0].copy()
     y = split_dfs[split][1]
 
+    X["pred_CLV_30d"] = ggf.customer_lifetime_value(
+        bgf,
+        X["frequency"],
+        X["recency"],
+        X["T"],
+        X["period_total_amount"],
+        time=30,
+        discount_rate=0.0,
+        freq="D"
+    )
 
     mae = (y["CLV_30d"] - X["pred_CLV_30d"]).abs().mean()
 
@@ -2316,3 +3534,178 @@ for split in split_dfs.keys():
 
 # %% [markdown]
 # That seems like a pretty big deviation. I will benchmark it with LGBM some time later.
+
+# %% [markdown]
+# # Approach 2 - Survival Analysis + Gamma–Gamma
+
+# %% [markdown]
+# I already trained and logged a model on 30 days cut off data, so I will just call the model instead of repeating the training pipeline.
+
+# %%
+X_train_survival_transformed
+
+# %%
+X_train_survival_transformed
+
+# %% [markdown]
+# ### Survival Model (Weibull)
+
+# %%
+survival_model, metadata = load_survival_analysis_model()
+
+# %%
+survival_model.predict_survival_function(X_train_survival_transformed)
+
+# %% [markdown]
+# ### Gamma-Gamma
+
+# %%
+ggf = GammaGammaFitter(penalizer_coef=0.05)
+
+summary_gg = X_train_survival_transformed[
+    (X_train_survival_transformed["period_transaction_count"] > 0)
+    &
+    (X_train_survival_transformed["period_total_amount"] > 0)
+]
+#summary_gg = X_train_survival_transformed[X_train_survival_transformed["period_total_amount"] > 0]
+
+ggf.fit(
+    summary_gg["period_transaction_count"],
+    summary_gg["period_total_amount"],
+)
+
+# %% [markdown]
+# ### Time-Dependent CLV
+
+# %%
+predict_survival_clv(
+    survival_model,
+    ggf,
+    X_train_survival_transformed,
+    horizon_days=30,
+)
+
+# %% [markdown]
+# ### Evaluate performance
+
+# %%
+split_dfs = {
+    'train': [X_train_survival_transformed, y_train],
+    'test': [X_test_survival_transformed, y_test],
+    'val': [X_val_survival_transformed, y_val]
+}
+
+# %%
+results_df = {}
+for split in split_dfs.keys():
+
+    print(f'Evaluation results for {split} set:')
+
+    X = split_dfs[split][0].copy()
+    y = split_dfs[split][1]
+
+    X["pred_CLV_30d"] = predict_survival_clv(
+        survival_model,
+        ggf,
+        X,
+        horizon_days=30,
+    )
+
+    mae = (y["CLV_30d"] - X["pred_CLV_30d"]).abs().mean()
+
+    results_df[split] = mae
+
+    print(mae)
+
+# %% [markdown]
+# # Compare Performance
+
+# %% [markdown]
+# Summary on model performance on current train, test, val set:
+#
+# Approach 1
+# - Evaluation results for train set: 317.51514088192545
+# - Evaluation results for test set: 310.1090018471975
+# - Evaluation results for val set: 345.60517674358726
+#
+# Approach 2
+# - Evaluation results for train set: 317.51514088192545
+# - Evaluation results for test set: 310.1090018471975
+# - Evaluation results for val set: 345.60517674358726
+#
+# The performance of Survival Analysis + Gamma-Gamma is much better than that of BG-NBD + Gamma-Gamma. It is not unexpected though, considering the fact that the Survival Analysis model use multivariates (much more features than the features allowed in BGF). 
+
+# %% [markdown]
+# # Productionize
+
+# %% [markdown]
+# ## Setup Mlflow
+
+# %%
+mlflow.set_experiment(EXPERIMENT_NAME)
+
+# %% [markdown]
+# ## Model Tuning
+
+# %%
+param_grid = {
+    "penalizer_coef": [0.0, 0.01, 0.05, 0.1],
+}
+
+for penalizer in param_grid["penalizer_coef"]:
+
+    run_name = f"gamma_gamma__pen{penalizer}"
+
+    with mlflow.start_run(run_name=run_name):
+
+        mlflow.log_param("dataset_version", f"{OBSERVED_DATE_STR}__cut_30d")
+
+        train_gamma_gamma(
+            X_train=X_train_survival_transformed,
+            model_params={"penalizer_coef": penalizer},
+        )
+
+# %% [markdown]
+# The model with the best performance is the one with no penalizer. It will be chosen for production.
+# ![gamma-gamma.png](attachment:gamma-gamma.png)
+# ![image.png](attachment:image.png)
+
+# %% [markdown]
+# ## Choose production model
+
+# %%
+promote_to_production("4973afd5021a4ddcaeebdae44c07540a")
+
+# %%
+ggf, ggf_metadata = load_gamma_gamma_model()
+
+# %%
+survival_model, survival_model_metadata = load_survival_analysis_model()
+
+# %%
+bgf, bgf_metadata = load_prod_bg_nbd()
+
+# %% [markdown]
+# ## Inference
+
+# %% [markdown]
+# The requirements specified that the users can choose the model at inference. Instead of reloading the model each time, I have used a simple method cache the models, so we don't have to redownload the model each time.
+
+# %%
+MODEL_STORE = {}
+
+# %%
+estimate_clv(
+    customer_id="C00013",
+    method="bgnbd",
+    horizon_days=30,
+    BASE_GOLD_DIR=BASE_GOLD_DIR
+)
+
+# %%
+estimate_clv(
+    customer_id="C00012",
+    method="bgnbd",
+    horizon_days=30,
+    BASE_GOLD_DIR=BASE_GOLD_DIR
+)
