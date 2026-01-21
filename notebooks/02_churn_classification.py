@@ -159,6 +159,9 @@ TRAIN_SNAPSHOT_DATE = MAX_DATA_DATE - pd.Timedelta(90, 'day')
 BASE_GOLD_DIR = PROJECT_ROOT / "data" / "gold" / MAX_DATA_DATE_STR
 
 # %%
+CLASSIFIER_DATA_PATH = BASE_GOLD_DIR / "cut_120d" / "features" / "classifier"
+
+# %%
 # This is no longer used. Updated to mlflow instead.
 #ARTIFACT_DIR = PROJECT_ROOT / MAX_DATA_DATE_STR / "/src/models/preprocessing"
 
@@ -1516,19 +1519,15 @@ def promote_to_production(run_id):
 
 
 # %%
-def get_production_runs():
-    return mlflow.search_runs(
+def load_churn_classifiers():
+    prod_runs = mlflow.search_runs(
         filter_string="tags.stage = 'production'",
         search_all_experiments=True,
         output_format="pandas",
     )
 
-    return runs
-
-
-# %%
-def load_production_models():
-    prod_runs = get_production_runs()
+    if prod_runs.empty:
+        raise ValueError("No production runs found")
 
     models = {}
     metadata = {}
@@ -1536,15 +1535,22 @@ def load_production_models():
     for _, row in prod_runs.iterrows():
         target = row["params.target"]
         dataset_version = row["params.dataset_version"]
+        dataset_type = row.get("params.dataset_type", "raw")
         run_id = row["run_id"]
 
-        model_uri = f"runs:/{run_id}/{dataset_version}_{target}"
+        artifact_name = f"{dataset_version}_{target}"
+        model_uri = f"runs:/{run_id}/{artifact_name}"
+
         model = mlflow.lightgbm.load_model(model_uri)
 
-        models[target] = model
-        metadata[target] = {
+        key = target
+
+        models[key] = model
+        metadata[key] = {
             "dataset_version": dataset_version,
+            "dataset_type": dataset_type,
             "run_id": run_id,
+            "artifact": artifact_name,
         }
 
     return models, metadata
@@ -1561,14 +1567,14 @@ def get_customer_features(
     if isinstance(customer_ids, str):
         customer_ids = [customer_ids]
 
-    dataset_version = metadata[target]["dataset_version"]
+    dataset_type = metadata[target]["dataset_type"]
 
-    if dataset_version == "raw":
+    if dataset_type == "raw":
         X = raw_features_df.loc[customer_ids]
-    elif dataset_version == "transformed":
+    elif dataset_type == "transformed":
         X = transformed_features_by_target[target].loc[customer_ids]
     else:
-        raise ValueError(f"Unknown dataset version: {dataset_version}")
+        raise ValueError(f"Unknown dataset version: {dataset_type}")
 
     return X
 
@@ -3073,7 +3079,6 @@ with open(PREPROCESSING_REF_DIR / "selected_features_by_target.json", "w") as f:
 # --------------------------------------------------
 # READ TARGETS
 # --------------------------------------------------
-CLASSIFIER_DATA_PATH = BASE_GOLD_DIR / "cut_120d" / "features" / "classifier"
 
 y_train = pd.read_csv(CLASSIFIER_DATA_PATH / "target" / "y_train.csv")
 y_val   = pd.read_csv(CLASSIFIER_DATA_PATH / "target" / "y_val.csv")
@@ -3150,35 +3155,6 @@ for num_leaves, lr, n_est, depth in product(
                     params=params,
                 )
 
-# %%
-
-# %%
-X_train_raw
-
-# %%
-# --------------------------------------------------
-# ORCHESTRATION
-# --------------------------------------------------
-for dataset_version, X_tr, X_v in [
-    ("raw", X_train_raw, X_val_raw),
-    ("transformed", None, None),  # handled below
-]:
-    for target in targets:
-        with mlflow.start_run(
-            run_name=f"{dataset_version}_{target}"
-        ):
-            mlflow.log_param("gold_data_version", BASE_GOLD_DIR.name)
-            mlflow.log_param("dataset_version", dataset_version)
-
-            train_lgbm(
-                X_train=X_tr if dataset_version == "raw" else X_train_transformed[target],
-                y_train=y_train,
-                X_val=X_v if dataset_version == "raw" else X_val_transformed[target],
-                y_val=y_val,
-                target=target,
-                dataset_version=dataset_version,
-            )
-
 # %% [markdown]
 # Using the Mlflow UI, we can compare the models:
 # - Generally prediction on shorter time windows have better performance.
@@ -3197,11 +3173,11 @@ for dataset_version, X_tr, X_v in [
 
 # %%
 ## 30 days - Transformed Features
-promote_to_production('744aa0baff5041c89e44a337899f6ad7')
+promote_to_production('db4a6872b6e44d11898424ba774b7720')
 ## 60 days - Transformed Features
-promote_to_production('9e9cdf63d96940ed9e0b66fafcba3214')
+promote_to_production('cb743302afe8484ba431b702f2250315')
 ## 90 days - Raw Features
-promote_to_production('dbe0047b0c9b44aa8874425f27f4f79b')
+promote_to_production('b61920fcc3f34944aa30504d28594957')
 
 # %% [markdown]
 # ## Remove Redundant Experiments
@@ -3210,9 +3186,10 @@ promote_to_production('dbe0047b0c9b44aa8874425f27f4f79b')
 EXPERIMENT_ID = client.get_experiment_by_name("churn_prediction").experiment_id
 
 KEEP_RUNS = {
-    "744aa0baff5041c89e44a337899f6ad7",
-    "9e9cdf63d96940ed9e0b66fafcba3214",
-    "dbe0047b0c9b44aa8874425f27f4f79b",
+    "db4a6872b6e44d11898424ba774b7720",
+    "cb743302afe8484ba431b702f2250315",
+    "b61920fcc3f34944aa30504d28594957",
+    "models"
 }
 
 exp_dir = MLRUNS_DIR / EXPERIMENT_ID
@@ -3230,13 +3207,27 @@ for run_dir in exp_dir.iterdir():
 # ## Load Data and Models
 
 # %%
-raw_features_df = load_features("raw")
+raw_features_df = load_features(
+    "raw",
+    gold_dir=CLASSIFIER_DATA_PATH
+)
 
 # %%
-transformed_features_by_target = load_features("transformed")
+transformed_features_by_target = load_features(
+    "transformed",
+    gold_dir=CLASSIFIER_DATA_PATH
+)
 
 # %%
-models, metadata = load_production_models()
+models, metadata = load_churn_classifiers()
+
+# %%
+models
+
+# %%
+for target in models:
+    print(target)
+
 
 # %% [markdown]
 # ## Inference
@@ -3313,15 +3304,10 @@ p90 = (
 prediction_df = pd.concat([p30, p60, p90], axis=1)
 
 # %%
-prediction_df.head()
+output_path = (
+    BASE_GOLD_DIR / "cut_120d"
+    / "inference"
+    / "churn_classifier_targets.csv"
+)
 
-# %%
-prediction_df.to_csv(BASE_GOLD_DIR / "inference" / "classifier_1" / "churn_prob.csv")
-
-# %%
-output_dir = BASE_GOLD_DIR / "inference" / "classifier_1"
-with open(output_dir / "metadata.json", "w") as f:
-    json.dump(metadata, f, indent=2)
-
-# %% [markdown]
-# I want to specify the set of models used for inference at the time, hence, I wrote the inference results in a folder, with metadata attached.
+prediction_df.to_csv(output_path)
