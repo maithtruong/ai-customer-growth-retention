@@ -1,5 +1,4 @@
 data/archive
-data/seed
 .env
 docs/*
 __pycache__/
