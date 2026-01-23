@@ -1,3 +1,0 @@
-          pred_0  pred_1
-actual_0     655      60
-actual_1      29     772

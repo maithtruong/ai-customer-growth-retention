@@ -1,3 +1,0 @@
-          pred_0  pred_1
-actual_0     943       0
-actual_1       0     573

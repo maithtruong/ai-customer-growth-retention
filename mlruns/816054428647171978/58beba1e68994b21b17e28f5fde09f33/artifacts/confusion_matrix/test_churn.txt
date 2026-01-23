@@ -1,3 +1,0 @@
-                 pred_no_churn  pred_churn
-actual_no_churn            278          28
-actual_churn                73         246

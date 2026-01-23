@@ -1,7 +1,0 @@
-artifact_location: file:///home/hong-mai/Desktop/HONGMAI/Coding/ai-customer-growth-retention/mlruns/602432439773044594
-creation_time: 1768989154079
-experiment_id: '602432439773044594'
-last_update_time: 1768989470722
-lifecycle_stage: deleted
-name: churn-prediction
-tags: {}

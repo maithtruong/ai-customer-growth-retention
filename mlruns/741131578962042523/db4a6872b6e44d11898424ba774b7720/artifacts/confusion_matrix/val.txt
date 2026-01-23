@@ -1,3 +1,0 @@
-          pred_0  pred_1
-actual_0      52      56
-actual_1      52      87
