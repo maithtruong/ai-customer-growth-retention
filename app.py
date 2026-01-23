@@ -4,6 +4,9 @@ from src.data import *
 from src.evaluate import *
 import cloudpickle
 import datetime as dt
+import pandas as pd
+import io
+from lifelines import WeibullAFTFitter
 
 if "clv_feat_df" not in st.session_state:
     st.session_state["clv_feat_df"] = None
