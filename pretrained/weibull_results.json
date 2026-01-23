@@ -1,0 +1,1 @@
+{"metrics": {"roc_auc": 0.7881100266193434, "pr_auc": 0.8436938985075659, "precision": 0.0, "recall": 0.0}, "cm_df": {"pred_no_churn": {"actual_no_churn": 1323, "actual_churn": 1495}, "pred_churn": {"actual_no_churn": 0, "actual_churn": 0}}}
