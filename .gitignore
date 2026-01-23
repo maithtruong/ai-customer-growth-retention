@@ -1,7 +1,5 @@
-data/*
 notebooks/*
 mlruns/*
-src/*
 .env
 docs/*
 __pycache__/
