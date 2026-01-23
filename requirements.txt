@@ -2,3 +2,6 @@ streamlit
 pandas
 lifelines
 scikit-learn
+cloudpickle
+json
+datetime
