@@ -3,5 +3,6 @@ pandas
 lifelines
 scikit-learn
 cloudpickle
-json
-datetime
+numpy
+scipy
+pyarrow
