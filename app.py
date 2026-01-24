@@ -28,7 +28,7 @@ data_choice = st.radio(
 clv_feat_df = None
 
 if data_choice == "Use sample data":
-    clv_feat_df = load_sample_features()
+    st.session_state["clv_feat_df"] = load_sample_features()
     ##
 elif data_choice == "Use my data":
 
